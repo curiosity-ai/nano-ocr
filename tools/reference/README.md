@@ -18,5 +18,13 @@ model folder (`huggingface-cli download datalab-to/indra-ocr --revision v3.1 --l
 | `dump_chandra_pipeline.py --chandra C --model M --image I` | `tests/data/reference/chandra_pipeline/chandra.json`: Chandra's whole hf pipeline on one image | `ChandraPipelineTests` |
 | `dump_surya_ocr_error.py --surya S --model M` | `tests/data/reference/surya_ocr_error/ocr_error.json`: the OCR-error classifier's ids, logits, labels and scores | `SuryaOcrErrorParityTests` |
 
+`dump_surya_detection.py` runs Surya's text-line detector (`surya/detection`) from a checkout of
+Surya with the checkpoint at `https://models.datalab.to/text_detection/2025_05_07/`, and needs the
+OpenCV Surya pins (4.11.0.86) in a virtual environment of its own; its docstring has the setup. It
+writes `tests/data/reference/surya_detection/` (per document the chunks, both resizes, the
+processor output, the model's maps, the stitched heatmaps, the thresholds and the boxes; the model's
+stages on one chunk), checked by `SuryaDetectionParityTests` with the checkpoint in
+`SURYA_DET_MODEL_DIR` or `tests/data/models/surya_det`.
+
 `tests/data/reference/` is git-ignored (a few hundred MB). The parity tests skip, rather than
 fail, when it is absent.

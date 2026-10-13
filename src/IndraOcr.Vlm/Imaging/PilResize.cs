@@ -81,13 +81,34 @@ public static class PilResize
     public static RgbImage ResizeTorchBicubic(RgbImage source, int width, int height) =>
         Resize(source, width, height, Filter.Bicubic, torchInt16: true);
 
-    private static RgbImage Resize(RgbImage source, int width, int height, Filter filter, bool torchInt16)
+    /// <summary>
+    /// Resizes the region <paramref name="box"/> of <paramref name="source"/> to
+    /// <paramref name="width"/> × <paramref name="height"/> — <c>Image.resize(size, filter, box)</c>,
+    /// which <c>Image.thumbnail</c> reaches after a <c>reduce</c> with a fractional box.
+    /// </summary>
+    /// <param name="source">The image to resample.</param>
+    /// <param name="width">Output width.</param>
+    /// <param name="height">Output height.</param>
+    /// <param name="filter">Reconstruction filter.</param>
+    /// <param name="box">
+    /// <c>(x0, y0, x1, y1)</c> in source pixels; Pillow hands it to C as <c>float</c>, so it is one here.
+    /// </param>
+    public static RgbImage Resize(
+        RgbImage source, int width, int height, Filter filter, (float X0, float Y0, float X1, float Y1) box) =>
+        Resize(source, width, height, filter, torchInt16: false, box);
+
+    private static RgbImage Resize(RgbImage source, int width, int height, Filter filter, bool torchInt16) =>
+        Resize(source, width, height, filter, torchInt16, (0f, 0f, source.Width, source.Height));
+
+    private static RgbImage Resize(
+        RgbImage source, int width, int height, Filter filter, bool torchInt16, (float X0, float Y0, float X1, float Y1) box)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
 
-        bool needHorizontal = width != source.Width;
-        bool needVertical = height != source.Height;
+        // ImagingResampleInner: a pass is skipped only when its axis keeps both size and box.
+        bool needHorizontal = width != source.Width || box.X0 != 0 || box.X1 != width;
+        bool needVertical = height != source.Height || box.Y0 != 0 || box.Y1 != height;
 
         if (!needHorizontal && !needVertical)
         {
@@ -100,7 +121,7 @@ public static class PilResize
         if (needHorizontal)
         {
             intermediate = RgbImage.Rent(width, source.Height);
-            ResampleHorizontal(source, intermediate, filter, torchInt16);
+            ResampleHorizontal(source, intermediate, filter, torchInt16, box.X0, box.X1);
             current = intermediate;
         }
 
@@ -110,7 +131,7 @@ public static class PilResize
         }
 
         RgbImage result = RgbImage.Rent(width, height);
-        ResampleVertical(current, result, filter, torchInt16);
+        ResampleVertical(current, result, filter, torchInt16, box.Y0, box.Y1);
         intermediate?.Dispose();
         return result;
     }
@@ -131,9 +152,22 @@ public static class PilResize
         bool torchInt16,
         out int[] bounds,
         out int[] coefficients,
+        out int precision) =>
+        PrecomputeCoefficients(inSize, 0f, inSize, outSize, filter, torchInt16, out bounds, out coefficients, out precision);
+
+    /// <summary>Pillow's <c>precompute_coeffs</c> over the source span <c>[in0, in1)</c>.</summary>
+    internal static int PrecomputeCoefficients(
+        int inSize,
+        float in0,
+        float in1,
+        int outSize,
+        Filter filter,
+        bool torchInt16,
+        out int[] bounds,
+        out int[] coefficients,
         out int precision)
     {
-        double scale = (double)inSize / outSize;
+        double scale = (double)(in1 - in0) / outSize;
         double filterScale = Math.Max(scale, 1.0);
         double support = (filter == Filter.Lanczos ? LanczosLobes : 2.0) * filterScale;
 
@@ -149,7 +183,7 @@ public static class PilResize
         {
             for (int index = 0; index < outSize; index++)
             {
-                double center = (index + 0.5) * scale;
+                double center = in0 + ((index + 0.5) * scale);
                 double inverseScale = 1.0 / filterScale;
 
                 int min = (int)(center - support + 0.5);
@@ -217,10 +251,11 @@ public static class PilResize
         return kernelSize;
     }
 
-    private static void ResampleHorizontal(RgbImage source, RgbImage destination, Filter filter, bool torchInt16)
+    private static void ResampleHorizontal(
+        RgbImage source, RgbImage destination, Filter filter, bool torchInt16, float in0, float in1)
     {
         int kernelSize = PrecomputeCoefficients(
-            source.Width, destination.Width, filter, torchInt16, out int[] bounds, out int[] coefficients, out int precision);
+            source.Width, in0, in1, destination.Width, filter, torchInt16, out int[] bounds, out int[] coefficients, out int precision);
 
         int height = source.Height;
         int outWidth = destination.Width;
@@ -258,10 +293,11 @@ public static class PilResize
         });
     }
 
-    private static void ResampleVertical(RgbImage source, RgbImage destination, Filter filter, bool torchInt16)
+    private static void ResampleVertical(
+        RgbImage source, RgbImage destination, Filter filter, bool torchInt16, float in0, float in1)
     {
         int kernelSize = PrecomputeCoefficients(
-            source.Height, destination.Height, filter, torchInt16, out int[] bounds, out int[] coefficients, out int precision);
+            source.Height, in0, in1, destination.Height, filter, torchInt16, out int[] bounds, out int[] coefficients, out int precision);
         int bias = 1 << (precision - 1);
 
         int width = destination.Width;

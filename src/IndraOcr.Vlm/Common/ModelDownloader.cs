@@ -90,6 +90,46 @@ public static class ModelDownloader
     public static string Ensure(string repository, IEnumerable<string> files, Action<string, long, long>? progress = null) =>
         EnsureAsync(repository, files, progress: progress).GetAwaiter().GetResult();
 
+    /// <summary>
+    /// Datalab's model store, which Surya's <c>S3DownloaderMixin</c> reads for <c>s3://</c>
+    /// checkpoints: <c>DATALAB_MODELS_ENDPOINT</c>, else https://models.datalab.to.
+    /// </summary>
+    public static string DatalabEndpoint =>
+        (Environment.GetEnvironmentVariable("DATALAB_MODELS_ENDPOINT") ?? "https://models.datalab.to").TrimEnd('/');
+
+    /// <summary>
+    /// Ensures <paramref name="files"/> of the Datalab checkpoint at <paramref name="path"/> (for
+    /// example <c>text_detection/2025_05_07</c>, from <c>s3://text_detection/2025_05_07</c>) are
+    /// present under <c>&lt;cache&gt;/datalab/&lt;path&gt;</c>, and returns that directory.
+    /// </summary>
+    public static async Task<string> EnsureDatalabAsync(
+        string path,
+        IEnumerable<string> files,
+        Action<string, long, long>? progress = null,
+        CancellationToken cancellation = default)
+    {
+        path = path.Trim('/');
+        string directory = Path.Combine(CacheRoot, "datalab", path.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(directory);
+        using var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
+        {
+            Timeout = Timeout.InfiniteTimeSpan,
+        };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("indra-ocr-dotnet/0.1");
+        foreach (string file in files)
+        {
+            string target = Path.Combine(directory, file.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            await DownloadAsync(client, $"{DatalabEndpoint}/{path}/{file}", target, file, progress, cancellation).ConfigureAwait(false);
+        }
+
+        return directory;
+    }
+
+    /// <summary>Synchronous <see cref="EnsureDatalabAsync"/>.</summary>
+    public static string EnsureDatalab(string path, IEnumerable<string> files, Action<string, long, long>? progress = null) =>
+        EnsureDatalabAsync(path, files, progress).GetAwaiter().GetResult();
+
     private static async Task DownloadAsync(
         HttpClient client,
         string url,
