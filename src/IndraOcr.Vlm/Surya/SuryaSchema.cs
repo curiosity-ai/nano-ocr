@@ -41,7 +41,7 @@ public sealed class LayoutBox : PolygonBox
 
     /// <summary>Reading-order index.</summary>
     [JsonPropertyName("position")]
-    public int Position { get; init; }
+    public int Position { get; set; }
 
     /// <summary>The model's estimate of the block's OCR token count.</summary>
     [JsonPropertyName("count")]

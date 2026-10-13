@@ -1,3 +1,4 @@
+using IndraOcr.Vlm.Surya;
 using System.Diagnostics;
 using System.Text.Json;
 using IndraOcr.Onnx;
@@ -209,7 +210,7 @@ public class SuryaLayoutParityTests(ITestOutputHelper output)
         LayoutResult free = predictor.Predict(image);
         AssertSameLayout(expectedBoxes, free, swapped == 0 ? 0.01 : 0.05, "end-to-end run");
 
-        output.WriteLine(string.Join("\n", result.Boxes.Select(b =>
+        output.WriteLine(string.Join("\n", result.Bboxes.Select(b =>
             $"{b.Position,2} {b.Label,-16} {b.Confidence:F4} [{string.Join(", ", b.Bbox.Select(v => v.ToString("F2")))}]")));
 
         // Timing of a warm page.
@@ -231,16 +232,16 @@ public class SuryaLayoutParityTests(ITestOutputHelper output)
     /// </summary>
     private void AssertSameLayout(JsonElement expectedBoxes, LayoutResult result, double pixels, string what)
     {
-        Assert.Equal(expectedBoxes.GetArrayLength(), result.Boxes.Count);
+        Assert.Equal(expectedBoxes.GetArrayLength(), result.Bboxes.Count);
         int i = 0;
         double worstCorner = 0, worstConfidence = 0;
         foreach (JsonElement e in expectedBoxes.EnumerateArray())
         {
-            LayoutBox b = result.Boxes[i++];
+            LayoutBox b = result.Bboxes[i++];
             Assert.Equal(e.GetProperty("label").GetString(), b.Label);
             Assert.Equal(e.GetProperty("raw_label").GetString(), b.RawLabel);
             Assert.Equal(e.GetProperty("position").GetInt32(), b.Position);
-            double dc = Math.Abs(e.GetProperty("confidence").GetDouble() - b.Confidence);
+            double dc = Math.Abs(e.GetProperty("confidence").GetDouble() - (b.Confidence ?? 0));
             worstConfidence = Math.Max(worstConfidence, dc);
             double[][] polygon = e.GetProperty("polygon").EnumerateArray()
                 .Select(p => p.EnumerateArray().Select(v => v.GetDouble()).ToArray()).ToArray();
@@ -255,7 +256,7 @@ public class SuryaLayoutParityTests(ITestOutputHelper output)
             }
         }
 
-        output.WriteLine($"{what}: {result.Boxes.Count} boxes, labels and order identical; worst corner {worstCorner:E2} px, worst confidence {worstConfidence:E2}");
+        output.WriteLine($"{what}: {result.Bboxes.Count} boxes, labels and order identical; worst corner {worstCorner:E2} px, worst confidence {worstConfidence:E2}");
         Assert.True(worstConfidence < 1e-3, $"{what}: confidence differs by {worstConfidence}");
     }
 

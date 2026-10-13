@@ -3,63 +3,6 @@ using IndraOcr.Vlm.Imaging;
 
 namespace IndraOcr.Vlm.Surya.Layout;
 
-/// <summary>
-/// One layout region — <c>surya.layout.schema.LayoutBox</c>: a polygon (here always the four
-/// corners of an axis-aligned box), the canonical and raw labels, the reading position and the
-/// detector's confidence.
-/// </summary>
-public sealed class LayoutBox
-{
-    /// <summary>Corners <c>[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]</c> (<c>_poly</c>).</summary>
-    public double[][] Polygon { get; internal set; } = [];
-
-    /// <summary>The label after <c>LAYOUT_PRED_RELABEL</c> (e.g. <c>SectionHeader</c>).</summary>
-    public string Label { get; init; } = string.Empty;
-
-    /// <summary>The detector's own label (e.g. <c>Section-Header</c>).</summary>
-    public string RawLabel { get; init; } = string.Empty;
-
-    /// <summary>Reading-order index, 0 first.</summary>
-    public int Position { get; internal set; }
-
-    /// <summary>Sigmoid confidence of the detection.</summary>
-    public double Confidence { get; init; }
-
-    /// <summary>The model's token estimate (<c>count</c>); the fast layout path leaves it 0.</summary>
-    public int Count { get; init; }
-
-    /// <summary><c>PolygonBox.bbox</c>: <c>[min x, min y, max x, max y]</c>.</summary>
-    public double[] Bbox => [
-        Polygon.Min(p => p[0]), Polygon.Min(p => p[1]), Polygon.Max(p => p[0]), Polygon.Max(p => p[1])];
-
-    /// <summary><c>PolygonBox.area</c>.</summary>
-    public double Area
-    {
-        get
-        {
-            double[] b = Bbox;
-            return (b[2] - b[0]) * (b[3] - b[1]);
-        }
-    }
-
-    /// <summary><c>PolygonBox.intersection_area</c> (no margins).</summary>
-    public double IntersectionArea(LayoutBox other)
-    {
-        double[] a = Bbox, b = other.Bbox;
-        double x = Math.Max(0, Math.Min(a[2], b[2]) - Math.Max(a[0], b[0]));
-        double y = Math.Max(0, Math.Min(a[3], b[3]) - Math.Max(a[1], b[1]));
-        return x * y;
-    }
-
-    internal static double[][] Poly(double x0, double y0, double x1, double y1) =>
-        [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
-}
-
-/// <summary><c>surya.layout.schema.LayoutResult</c>: a page's boxes in reading order.</summary>
-/// <param name="Boxes">The regions, sorted by <see cref="LayoutBox.Position"/>.</param>
-/// <param name="ImageBbox"><c>[0, 0, width, height]</c>.</param>
-public sealed record LayoutResult(IReadOnlyList<LayoutBox> Boxes, double[] ImageBbox);
-
 /// <summary>Options for <see cref="FastLayoutPredictor.Predict"/>.</summary>
 public sealed record FastLayoutOptions
 {
@@ -182,7 +125,7 @@ public sealed class FastLayoutPredictor
             RfDetrDetection d = dets[i];
             boxes.Add(new LayoutBox
             {
-                Polygon = LayoutBox.Poly(d.X0, d.Y0, d.X1, d.Y1),
+                Polygon = PolygonBox.FromBox(d.X0, d.Y0, d.X1, d.Y1),
                 Label = Relabel.TryGetValue(d.Label, out string? l) ? l : d.Label,
                 RawLabel = d.Label,
                 Position = positions[i],
@@ -192,7 +135,23 @@ public sealed class FastLayoutPredictor
 
         List<LayoutBox> merged = MergeContainedBoxes(boxes, containment);
         merged = merged.OrderBy(b => b.Position).ToList();
-        return new LayoutResult(merged, [0.0, 0.0, width, height]);
+        return new LayoutResult { Bboxes = merged, ImageBbox = [0.0, 0.0, width, height] };
+    }
+
+    /// <summary><c>PolygonBox.area</c>.</summary>
+    private static double Area(LayoutBox box)
+    {
+        double[] b = box.Bbox;
+        return (b[2] - b[0]) * (b[3] - b[1]);
+    }
+
+    /// <summary><c>PolygonBox.intersection_area</c> (no margins).</summary>
+    private static double IntersectionArea(LayoutBox a, LayoutBox b)
+    {
+        double[] p = a.Bbox, q = b.Bbox;
+        double x = Math.Max(0, Math.Min(p[2], q[2]) - Math.Max(p[0], q[0]));
+        double y = Math.Max(0, Math.Min(p[3], q[3]) - Math.Max(p[1], q[1]));
+        return x * y;
     }
 
     /// <summary>
@@ -208,7 +167,7 @@ public sealed class FastLayoutPredictor
         }
 
         var survivors = new List<LayoutBox>();
-        foreach (LayoutBox b in boxes.OrderByDescending(x => x.Area))
+        foreach (LayoutBox b in boxes.OrderByDescending(Area))
         {
             bool absorbed = false;
             foreach (LayoutBox s in survivors)
@@ -218,11 +177,11 @@ public sealed class FastLayoutPredictor
                     continue;
                 }
 
-                double area = b.Area;
-                if (area > 0 && s.IntersectionArea(b) / area >= threshold)
+                double area = Area(b);
+                if (area > 0 && IntersectionArea(s, b) / area >= threshold)
                 {
                     double[] sb = s.Bbox, bb = b.Bbox;
-                    s.Polygon = LayoutBox.Poly(
+                    s.Polygon = PolygonBox.FromBox(
                         Math.Min(sb[0], bb[0]), Math.Min(sb[1], bb[1]), Math.Max(sb[2], bb[2]), Math.Max(sb[3], bb[3]));
                     absorbed = true;
                     break;
