@@ -74,6 +74,15 @@ def main() -> None:
     cv2.imwrite(str(a.out / "color.png"), rgb)
     add("decode_color_png", "decode", "color.png", {}, cv2.imread(str(a.out / "color.png"), cv2.IMREAD_GRAYSCALE))
 
+    # TIFF pages (cv2.imreadmulti), every compression the corpus holds.
+    tiffs = sorted((a.docs / "tiff").glob("*.tif")) + [a.docs / "inputs" / "three.tiff"]
+    for f in tiffs:
+        ok, frames = cv2.imreadmulti(str(f), flags=cv2.IMREAD_GRAYSCALE)
+        name = "tiff_" + f.name
+        for i, fr in enumerate(frames):
+            arrays[f"out.{name}.{i}"] = fr
+        cases.append({"name": name, "op": "tiff", "input": str(f.relative_to(ROOT)), "args": {"frames": len(frames)}})
+
     np.savez_compressed(a.out / "imaging.npz", **arrays)
     (a.out / "imaging.json").write_text(json.dumps(cases, indent=1))
     print(len(cases), "cases")

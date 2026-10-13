@@ -12,6 +12,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="IndraOcr.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- The models ship inside the assembly: no download, no model folder to manage. -->
     <EmbeddedResource Include="Models/Assets/*.onnx;Models/Assets/*.json" LogicalName="IndraOcr.Models.%(Filename)%(Extension)" />
   </ItemGroup>

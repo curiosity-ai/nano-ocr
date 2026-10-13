@@ -32,9 +32,14 @@ public static class ImageIO
         return pages;
     }
 
-    /// <summary>Decodes encoded image bytes (PNG, JPEG, WebP, GIF, BMP, ICO, …) to grayscale frames.</summary>
+    /// <summary>Decodes encoded image bytes (PNG, JPEG, WebP, GIF, BMP, ICO, multi-page TIFF, …) to grayscale frames.</summary>
     public static List<GrayImage> Decode(byte[] bytes)
     {
+        if (TiffDecoder.IsTiff(bytes))
+        {
+            return TiffDecoder.Decode(bytes);
+        }
+
         var pages = new List<GrayImage>();
         using var data = SKData.CreateCopy(bytes);
         using SKCodec? codec = SKCodec.Create(data);

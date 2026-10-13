@@ -108,6 +108,21 @@ public class ImagingParityTests(ITestOutputHelper output)
                     break;
                 }
 
+            case "tiff":
+                {
+                    List<GrayImage> frames = ImageIO.ReadPages(Path.Combine(TestData.Root, input));
+                    Assert.Equal(args.GetProperty("frames").GetInt32(), frames.Count);
+                    for (int i = 0; i < frames.Count; i++)
+                    {
+                        Tensor want = a[$"out.{name}.{i}"];
+                        Assert.Equal(want.Shape[0], frames[i].Height);
+                        Assert.Equal(want.Shape[1], frames[i].Width);
+                        AssertBytes(want, frames[i].Pixels, maxLevel: 0, maxFraction: 0);
+                    }
+
+                    break;
+                }
+
             default:
                 throw new InvalidOperationException(op);
         }

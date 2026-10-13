@@ -10,6 +10,10 @@ Writes:
   page_math.png         lines with inline formulas (mathcls.onnx and the math decoder)
   digital.pdf           a born-digital two-page PDF with a text layer (the text-layer path)
   scanned.pdf           page_two_column.png wrapped in a PDF with no text layer (the OCR path)
+  tiff/*.tif            the page as TIFF in every compression a scanner writes (raw, PackBits,
+                        LZW, Deflate, CCITT G3 and G4), RGB, palette, and multi-page files
+  inputs/*              small files for the input-handling tests: five blank pages, a poster
+                        page, a password-locked PDF (password "pw"), unreadable files
 
 The pages are deterministic: the same fonts and layout give the same pixels.
 """
@@ -139,7 +143,7 @@ def digital_pdf(path: Path) -> None:
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
 
-    c = canvas.Canvas(str(path), pagesize=letter)
+    c = canvas.Canvas(str(path), pagesize=letter, invariant=1)
     W, H = letter
     for page in range(2):
         c.setFont("Times-Bold", 20)
@@ -183,7 +187,55 @@ def main(out: Path) -> None:
     chinese_page().save(out / "page_chinese.png")
     math_page().save(out / "page_math.png")
     digital_pdf(out / "digital.pdf")
-    page.convert("RGB").save(out / "scanned.pdf", resolution=200.0)
+    import datetime
+
+    fixed = datetime.datetime(2026, 1, 1)
+    page.convert("RGB").save(out / "scanned.pdf", resolution=200.0, creationDate=fixed, modDate=fixed)
+    tiffs(page, out / "tiff")
+    inputs(out / "inputs")
+
+
+def tiffs(page: Image.Image, out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    half = page.resize((page.width // 2, page.height // 2), Image.BILINEAR)
+    quarter = page.resize((page.width // 4, page.height // 4), Image.BILINEAR)
+    for comp in ("raw", "packbits", "tiff_lzw", "tiff_adobe_deflate"):
+        (quarter if comp == "raw" else half).save(out / f"gray_{comp}.tif", compression=comp)
+    bw = half.point(lambda v: 255 if v > 128 else 0).convert("1")
+    for comp in ("group3", "group4", "packbits"):
+        bw.save(out / f"bilevel_{comp}.tif", compression=comp)
+    half.convert("RGB").save(out / "rgb_lzw.tif", compression="tiff_lzw")
+    quarter.convert("P").save(out / "palette.tif", compression="packbits")
+    frames = [half, half.rotate(90, expand=True, fillcolor=255), Image.new("L", (300, 400), 255)]
+    frames[0].save(out / "multipage.tif", save_all=True, append_images=frames[1:], compression="tiff_lzw")
+    bwf = [f.point(lambda v: 255 if v > 128 else 0).convert("1") for f in frames]
+    bwf[0].save(out / "multipage_g4.tif", save_all=True, append_images=bwf[1:], compression="group4")
+
+
+def inputs(out: Path) -> None:
+    import pikepdf
+    import pypdfium2 as pdfium
+
+    out.mkdir(parents=True, exist_ok=True)
+
+    def pdf(path, sizes):
+        doc = pdfium.PdfDocument.new()
+        for w, h in sizes:
+            doc.new_page(w, h)
+        doc.save(str(path))
+
+    pdf(out / "five.pdf", [(200, 300)] * 5)
+    pdf(out / "poster.pdf", [(14400, 14400), (612, 792)])
+    pdf(out / "plain.pdf", [(200, 300)])
+    pikepdf.open(out / "plain.pdf").save(out / "locked.pdf", encryption=pikepdf.Encryption(user="pw", owner="owner"))
+    (out / "plain.pdf").unlink()
+    frames = [Image.new("L", (60, 80), v) for v in (255, 200, 255)]
+    frames[0].save(out / "three.tiff", save_all=True, append_images=frames[1:])
+    (out / "garbage.pdf").write_bytes(b"%PDF-1.4 broken")
+    (out / "empty.png").write_bytes(b"")
+    (out / "text.txt").write_bytes(b"hello")
+    Image.new("L", (40, 50), 255).save(out / "image_named.pdf.png")
+    (out / "image_named.pdf.png").rename(out / "image_named.pdf")
 
 
 if __name__ == "__main__":
