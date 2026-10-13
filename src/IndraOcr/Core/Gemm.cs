@@ -57,7 +57,7 @@ public static unsafe class Gemm
         {
             long work = (long)m * n * k;
             int workers = Parallelism.Workers;
-            if (workers <= 1 || work < 1 << 18)
+            if (workers <= 1 || work < 1 << 20)
             {
                 Region(pa, lda, pb, ldb, pc, ldc, 0, m, 0, n, k, accumulate);
                 return;
@@ -332,11 +332,60 @@ public static unsafe class Gemm
                     Rows4(a + (i * (long)lda) + kb, lda, b + (kb * (long)ldb), ldb, c + (i * (long)ldc), ldc, jb, je, kc, add);
                 }
 
+                if (i1 - i > 1)
+                {
+                    // Two or three rows left: pad to four so B is streamed once, not once per row.
+                    RowsPadded(a + (i * (long)lda) + kb, lda, b + (kb * (long)ldb), ldb, c + (i * (long)ldc), ldc, jb, je, kc, add, i1 - i);
+                    i = i1;
+                }
+
                 for (; i < i1; i++)
                 {
                     Rows1(a + (i * (long)lda) + kb, b + (kb * (long)ldb), ldb, c + (i * (long)ldc), jb, je, kc, add);
                 }
             }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RowsPadded(float* a, int lda, float* b, int ldb, float* c, int ldc, int j0, int j1, int kc, bool add, int rows)
+    {
+        int width = j1 - j0;
+        float[] scratchA = System.Buffers.ArrayPool<float>.Shared.Rent(4 * kc);
+        float[] scratchC = System.Buffers.ArrayPool<float>.Shared.Rent(4 * width);
+        try
+        {
+            fixed (float* sa = scratchA)
+            fixed (float* sc = scratchC)
+            {
+                for (int r = 0; r < 4; r++)
+                {
+                    for (int p = 0; p < kc; p++)
+                    {
+                        sa[(r * kc) + p] = r < rows ? a[(r * (long)lda) + p] : 0f;
+                    }
+
+                    for (int q = 0; q < width; q++)
+                    {
+                        sc[(r * width) + q] = add && r < rows ? c[(r * (long)ldc) + j0 + q] : 0f;
+                    }
+                }
+
+                // Rows4 addresses C by absolute column; shift the scratch so column j0 lands at 0.
+                Rows4(sa, kc, b, ldb, sc - j0, width, j0, j1, kc, add);
+                for (int r = 0; r < rows; r++)
+                {
+                    for (int q = 0; q < width; q++)
+                    {
+                        c[(r * (long)ldc) + j0 + q] = sc[(r * width) + q];
+                    }
+                }
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(scratchA);
+            System.Buffers.ArrayPool<float>.Shared.Return(scratchC);
         }
     }
 

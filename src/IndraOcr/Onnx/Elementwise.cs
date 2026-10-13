@@ -315,11 +315,7 @@ internal static partial class Operators
 
                 break;
             case UnaryOp.Erf:
-                for (int i = 0; i < x.Length; i++)
-                {
-                    z[i] = Activations.Erf(x[i]);
-                }
-
+                Activations.Erf(x, z);
                 break;
         }
     }

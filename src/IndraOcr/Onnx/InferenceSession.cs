@@ -37,6 +37,7 @@ public sealed class InferenceSession
             _nodes.Add(node);
         }
 
+        FoldConstants();
         _kernels = new Operators.Kernel[_nodes.Count];
         for (int i = 0; i < _nodes.Count; i++)
         {
@@ -53,6 +54,7 @@ public sealed class InferenceSession
         }
 
         _graphOutputs = new HashSet<string>(_graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
+        _plan = new Lazy<Plan>(BuildPlan);
         InputNames = _graph.Inputs.Select(i => i.Name).ToArray();
         OutputNames = _graph.Outputs.Select(o => o.Name).ToArray();
     }
@@ -89,37 +91,50 @@ public sealed class InferenceSession
     /// </param>
     public Tensor[] Run(IReadOnlyDictionary<string, Tensor> inputs, Action<string, Tensor>? observer = null)
     {
-        var values = new Dictionary<string, Tensor>(_constants, StringComparer.Ordinal);
-        var owned = new HashSet<string>(StringComparer.Ordinal);
-        foreach (OnnxValueInfo input in _graph.Inputs)
+        Plan plan = _plan.Value;
+        var values = new Tensor?[plan.SlotCount];
+        var owned = new bool[plan.SlotCount];
+        foreach (var (slot, t) in plan.Constants)
         {
-            if (!inputs.TryGetValue(input.Name, out Tensor? t))
+            values[slot] = t;
+        }
+
+        for (int i = 0; i < _graph.Inputs.Count; i++)
+        {
+            string name = _graph.Inputs[i].Name;
+            if (!inputs.TryGetValue(name, out Tensor? t))
             {
-                throw new ArgumentException($"Missing graph input '{input.Name}'.", nameof(inputs));
+                throw new ArgumentException($"Missing graph input '{name}'.", nameof(inputs));
             }
 
-            values[input.Name] = t;
+            values[plan.InputSlots[i]] = t;
+        }
+
+        if (observer is not null)
+        {
+            foreach (string name in _folded)
+            {
+                observer(name, _constants[name]);
+            }
         }
 
         var args = new List<Tensor?>(8);
         for (int i = 0; i < _nodes.Count; i++)
         {
             OnnxNode node = _nodes[i];
+            int[] ins = plan.NodeInputs[i];
             args.Clear();
-            foreach (string name in node.Inputs)
+            for (int k = 0; k < ins.Length; k++)
             {
-                if (name.Length == 0)
+                int slot = ins[k];
+                if (slot < 0)
                 {
                     args.Add(null);
+                    continue;
                 }
-                else if (values.TryGetValue(name, out Tensor? t))
-                {
-                    args.Add(t);
-                }
-                else
-                {
-                    throw new InvalidOperationException($"Node '{node.Name}' ({node.OpType}) reads '{name}', which no node produced.");
-                }
+
+                args.Add(values[slot] ?? throw new InvalidOperationException(
+                    $"Node '{node.Name}' ({node.OpType}) reads '{node.Inputs[k]}', which no node produced."));
             }
 
             long start = Profile is null ? 0 : Stopwatch.GetTimestamp();
@@ -137,59 +152,144 @@ public sealed class InferenceSession
             if (Profile is not null)
             {
                 double ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
-                string key = node.OpType is "Mul" ? $"Mul {string.Join("x", args[0]!.Shape)}*{string.Join("x", args[1]!.Shape)}" : node.OpType == "Conv"
+                string key = node.OpType is "MatMul" or "Transpose" or "Gather" ? $"{node.OpType} {string.Join("x", args[0]!.Shape)}*{string.Join("x", args.Count > 1 && args[1] is not null ? args[1]!.Shape : [])}" : node.OpType is "Mul" ? $"Mul {string.Join("x", args[0]!.Shape)}*{string.Join("x", args[1]!.Shape)}" : node.OpType == "Conv"
                     ? $"Conv {string.Join("x", node.Ints("kernel_shape") ?? [])} g{node.Int("group", 1)} {string.Join("x", args[0]!.Shape)}"
                     : node.OpType;
                 Profile[key] = Profile.GetValueOrDefault(key) + ms;
                 Profile["#" + key] = Profile.GetValueOrDefault("#" + key) + 1;
             }
 
-            for (int o = 0; o < node.Outputs.Count && o < results.Length; o++)
+            int[] outs = plan.NodeOutputs[i];
+            for (int o = 0; o < outs.Length && o < results.Length; o++)
             {
-                string name = node.Outputs[o];
-                if (name.Length == 0)
+                int slot = outs[o];
+                if (slot < 0)
                 {
                     results[o].Release();
                     continue;
                 }
 
-                values[name] = results[o];
-                owned.Add(name);
-                observer?.Invoke(name, results[o]);
-                if (!_lastUse.ContainsKey(name) && !_graphOutputs.Contains(name))
+                observer?.Invoke(node.Outputs[o], results[o]);
+                if (plan.LastUse[slot] < 0 && !plan.IsOutput[slot])
                 {
-                    values.Remove(name);
-                    owned.Remove(name);
                     results[o].Release();
+                    continue;
                 }
+
+                values[slot] = results[o];
+                owned[slot] = true;
             }
 
             // Release every input whose last reader was this node.
-            foreach (string name in node.Inputs)
+            foreach (int slot in plan.Frees[i])
             {
-                if (name.Length > 0 && _lastUse.TryGetValue(name, out int last) && last == i
-                    && owned.Remove(name) && !_graphOutputs.Contains(name))
+                if (owned[slot])
                 {
-                    values[name].Release();
-                    values.Remove(name);
+                    values[slot]!.Release();
+                    values[slot] = null;
+                    owned[slot] = false;
                 }
             }
         }
 
-        var outputs = new Tensor[_graph.Outputs.Count];
+        var outputs = new Tensor[plan.OutputSlots.Length];
         for (int o = 0; o < outputs.Length; o++)
         {
-            string name = _graph.Outputs[o].Name;
-            outputs[o] = values[name];
-            owned.Remove(name);
+            int slot = plan.OutputSlots[o];
+            outputs[o] = values[slot] ?? throw new InvalidOperationException($"Output '{_graph.Outputs[o].Name}' was not produced.");
+            owned[slot] = false;
         }
 
-        foreach (string name in owned)
+        for (int slot = 0; slot < owned.Length; slot++)
         {
-            values[name].Release();
+            if (owned[slot])
+            {
+                values[slot]!.Release();
+            }
         }
 
         return outputs;
+    }
+
+    /// <summary>
+    /// The graph compiled to integer value slots: each node's input and output slots, the slots it
+    /// frees, the constants and the graph's inputs and outputs — so a run indexes arrays instead
+    /// of hashing names, which matters for the math decoder's 600-node step graph run per token.
+    /// </summary>
+    private sealed class Plan
+    {
+        public int SlotCount;
+        public List<(int Slot, Tensor Value)> Constants = [];
+        public int[] InputSlots = [];
+        public int[] OutputSlots = [];
+        public int[][] NodeInputs = [];
+        public int[][] NodeOutputs = [];
+        public int[][] Frees = [];
+        public int[] LastUse = [];
+        public bool[] IsOutput = [];
+    }
+
+    private readonly Lazy<Plan> _plan;
+    private readonly List<string> _folded = [];
+
+    /// <summary>Node outputs computed once at load because every input was constant.</summary>
+    public IReadOnlyList<string> FoldedValues => _folded;
+
+    private Plan BuildPlan()
+    {
+        var slots = new Dictionary<string, int>(StringComparer.Ordinal);
+        int Slot(string name)
+        {
+            if (!slots.TryGetValue(name, out int s))
+            {
+                s = slots.Count;
+                slots[name] = s;
+            }
+
+            return s;
+        }
+
+        var plan = new Plan();
+        foreach (var (name, t) in _constants)
+        {
+            plan.Constants.Add((Slot(name), t));
+        }
+
+        plan.InputSlots = _graph.Inputs.Select(i => Slot(i.Name)).ToArray();
+        plan.NodeInputs = _nodes.Select(n => n.Inputs.Select(x => x.Length == 0 ? -1 : Slot(x)).ToArray()).ToArray();
+        plan.NodeOutputs = _nodes.Select(n => n.Outputs.Select(x => x.Length == 0 ? -1 : Slot(x)).ToArray()).ToArray();
+        plan.OutputSlots = _graph.Outputs.Select(o => Slot(o.Name)).ToArray();
+        plan.SlotCount = slots.Count;
+        plan.LastUse = new int[plan.SlotCount];
+        Array.Fill(plan.LastUse, -1);
+        for (int i = 0; i < _nodes.Count; i++)
+        {
+            foreach (int s in plan.NodeInputs[i])
+            {
+                if (s >= 0)
+                {
+                    plan.LastUse[s] = i;
+                }
+            }
+        }
+
+        plan.IsOutput = new bool[plan.SlotCount];
+        foreach (int s in plan.OutputSlots)
+        {
+            plan.IsOutput[s] = true;
+        }
+
+        var frees = Enumerable.Range(0, _nodes.Count).Select(_ => new List<int>()).ToArray();
+        for (int s = 0; s < plan.SlotCount; s++)
+        {
+            if (plan.LastUse[s] >= 0 && !plan.IsOutput[s])
+            {
+                frees[plan.LastUse[s]].Add(s);
+            }
+        }
+
+        plan.Frees = frees.Select(f => f.ToArray()).ToArray();
+        return plan;
     }
 
     /// <summary>Runs the graph with inputs given in <see cref="InputNames"/> order.</summary>
@@ -208,6 +308,47 @@ public sealed class InferenceSession
 
         return Run(map);
     }
+
+    /// <summary>
+    /// Runs, once at load, every node whose inputs are all constants (a transposed weight, a shape
+    /// computed from constants) and keeps the result as a constant — what ONNX Runtime's constant
+    /// folding does, so the math decoder does not re-transpose a weight on every token.
+    /// </summary>
+    private void FoldConstants()
+    {
+        var keep = new List<OnnxNode>(_nodes.Count);
+        foreach (OnnxNode node in _nodes)
+        {
+            Operators.Kernel? kernel = Operators.Resolve(node);
+            bool foldable = kernel is not null && node.Inputs.Count > 0
+                && node.Inputs.All(i => i.Length == 0 || _constants.ContainsKey(i))
+                && node.Outputs.All(o => !_graph.Outputs.Any(g => g.Name == o));
+            if (!foldable)
+            {
+                keep.Add(node);
+                continue;
+            }
+
+            var args = node.Inputs.Select(i => i.Length == 0 ? null : _constants[i]).ToList();
+            Tensor[] results = kernel!(node, args);
+            for (int o = 0; o < node.Outputs.Count && o < results.Length; o++)
+            {
+                _constants[node.Outputs[o]] = Materialize(results[o]);
+                _folded.Add(node.Outputs[o]);
+            }
+        }
+
+        _nodes.Clear();
+        _nodes.AddRange(keep);
+    }
+
+    /// <summary>A pinned copy that owns exactly its data (a pooled array may be longer).</summary>
+    private static Tensor Materialize(Tensor t) => t.Type switch
+    {
+        ElementType.Float => Tensor.FromFloats(t.ToFloatArray() is { Length: > 0 } f ? f : [0f], t.Shape),
+        ElementType.Int64 => Tensor.FromLongs(t.ToLongArray() is { Length: > 0 } l ? l : [0L], t.Shape),
+        _ => Tensor.FromBools(t.Bools.ToArray() is { Length: > 0 } b ? b : [false], t.Shape),
+    };
 
     private static Tensor ConstantValue(OnnxNode node)
     {

@@ -18,7 +18,7 @@ internal static class Bench
         int threads = Arg(args, "--threads", Environment.ProcessorCount);
         GrayImage gray = ImageIO.ReadPages(path)[0];
         long c0 = Stopwatch.GetTimestamp();
-        var engine = new IndraEngine();
+        var engine = new IndraEngine(new EngineOptions { Math = Environment.GetEnvironmentVariable("BENCH_MATH") == "1" });
         double load = Stopwatch.GetElapsedTime(c0).TotalMilliseconds;
         using var _ = IndraOcr.Core.Parallelism.Use(threads);
         c0 = Stopwatch.GetTimestamp();
