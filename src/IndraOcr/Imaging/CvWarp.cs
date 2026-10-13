@@ -8,12 +8,14 @@ namespace IndraOcr.Imaging;
 /// <remarks>
 /// Ported from <c>opencv/modules/imgproc/src/warp_kernels.simd.hpp</c>
 /// (<c>warpAffineLinearInvoker_8UC1</c> / <c>_32FC1</c>), the float-coordinate kernels OpenCV 4.11+
-/// uses: the matrix is narrowed to float, a source position is <c>fma(M0, x, y·M1 + M2)</c>,
+/// uses: the matrix is narrowed to float, a source position is <c>fma(M0, x, y·M1 + M2)</c> (the
+/// row term unfused),
 /// the weights are its fractional parts, and the blend is two horizontal <c>fma</c> lerps then a
 /// vertical one, rounded half to even for 8-bit output.
 /// </remarks>
 public static class CvWarp
 {
+
     /// <summary>The 2×3 matrix rotating by <paramref name="degrees"/> counter-clockwise about (cx, cy).</summary>
     public static double[] RotationMatrix(double cx, double cy, double degrees, double scale = 1.0)
     {
@@ -59,8 +61,10 @@ public static class CvWarp
         {
             for (int y = y0; y < y1; y++)
             {
-                float mx = MathF.FusedMultiplyAdd(y, m[1], m[2]);
-                float my = MathF.FusedMultiplyAdd(y, m[4], m[5]);
+                // The row offset is a plain multiply-add and the per-pixel step a fused one, as
+                // OpenCV's vector kernel computes them; anything else moves ~0.006% of pixels by a level.
+                float mx = (y * m[1]) + m[2];
+                float my = (y * m[4]) + m[5];
                 int row = y * w;
                 for (int x = 0; x < w; x++)
                 {
@@ -107,8 +111,8 @@ public static class CvWarp
         float[] d = dst;
         for (int y = 0; y < h; y++)
         {
-            float mx = MathF.FusedMultiplyAdd(y, m[1], m[2]);
-            float my = MathF.FusedMultiplyAdd(y, m[4], m[5]);
+            float mx = (y * m[1]) + m[2];
+            float my = (y * m[4]) + m[5];
             int row = y * w;
             for (int x = 0; x < w; x++)
             {
