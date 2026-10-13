@@ -91,6 +91,61 @@ indra-ocr scan.png --save-img out/        # draw blocks and lines over the page
 indra-ocr bench page.png                  # warm stage timings, per-operator profile
 ```
 
+## Chandra 2 and Surya 2
+
+`src/IndraOcr.Vlm` (NuGet `IndraOCR.Vlm`) ports Datalab's vision-language OCR to pure C#:
+[Chandra 2](https://github.com/datalab-to/chandra) (`datalab-to/chandra-ocr-2`, 5.3B parameters:
+page → layout-aware HTML, markdown and figure crops) and
+[Surya 2](https://github.com/datalab-to/surya) (`datalab-to/surya-ocr-2`, 0.69B: layout, full-page
+and block OCR, table rows/columns), plus Surya's non-VLM models — the text-line detector, the
+RF-DETR fast layout with its reading-order head, and the OCR-error classifier. Both VLMs are
+Qwen3.5 (a ViT plus a hybrid gated-delta-net / gated-attention decoder), run by one engine with
+bf16 weights and float32 arithmetic. No libtorch, no vLLM, no ONNX Runtime, no Python.
+
+The checkpoints are too large to embed (1.4 GB and 10.6 GB): they are downloaded from the
+Hugging Face Hub (or Datalab's model store) on first use into `~/.cache/indra-ocr`, or read from a
+folder you pass.
+
+```csharp
+using IndraOcr.Vlm.Chandra;
+using IndraOcr.Vlm.Surya;
+
+using var chandra = ChandraOcr.Load();                         // or Load("/models/chandra-ocr-2")
+List<ChandraPage> pages = chandra.PredictFile("paper.pdf");    // markdown, html, chunks, figures
+ChandraOcr.SaveMergedOutput("out", "paper.pdf", pages);        // out/paper/paper.md, .html, _metadata.json
+
+using var surya = SuryaInference.Load();
+using RgbImage page = RgbImageIO.Read("scan.png");
+LayoutResult layout = new SuryaLayoutPredictor(surya).Predict([page])[0];
+PageOcrResult ocr = new SuryaRecognitionPredictor(surya).Predict([page], fullPage: true)[0];
+TableResult table = new SuryaTableRecPredictor(surya).PredictSimple([page])[0];
+```
+
+```shell
+indra-vlm chandra paper.pdf out/                     # chandra INPUT OUTPUT, same flags as the Python CLI
+indra-vlm surya ocr scan.png --output-dir out/       # surya_ocr  -> out/scan/results.json
+indra-vlm surya layout page.pdf                      # surya_layout
+indra-vlm surya table page.pdf --mode full           # surya_table
+indra-vlm surya fast-layout page.png                 # RF-DETR layout + reading order
+indra-vlm surya detect page.png                      # text lines
+```
+
+What is checked against the originals (the reference scripts are in
+[`tools/reference`](tools/reference/README.md)):
+
+| Check | Result |
+| --- | --- |
+| `VlmParityTests` — preprocessing, every vision block, every decoder layer, greedy decoding vs transformers, both checkpoints | preprocessing **byte-exact**; layers within 1.8e-4 (Surya) and 4.7e-4 (Chandra) of the 1e-3 tolerance; 96 and 64 greedy tokens identical |
+| `HtmlParityTests` — 356 HTML strings (model-shaped, malformed, seeded fuzz) through BeautifulSoup, markdownify 1.1.0, Chandra's and Surya's parsers | every string identical |
+| `SuryaVlmParityTests` — Surya's own layout, full-page OCR, block OCR and table predictors | raw outputs and parsed results identical |
+| `ChandraPipelineTests` — Chandra's own `load_file` → generate → parse | raw output, markdown, HTML, chunks identical |
+| `SuryaLayoutParityTests`, `SuryaDetectionParityTests`, `SuryaOcrErrorParityTests` | per-stage tensors within tolerance; boxes, labels, order and classifications identical |
+
+On CPU these are slow models: on the 4-core test VM a Surya 2 block decodes at ~70 ms/token and
+Chandra 2 at ~0.6 s/token (both bound by reading the weights), and a page's vision tower and
+prefill take tens of seconds to minutes. Pages and blocks are decoded in batches, which reads the
+weights once per step for the whole batch.
+
 ## Output
 
 Each page (`OcrResult.Page`) has `Lines` (box, text, confidence, in reading order), `Blocks`
@@ -150,6 +205,8 @@ src/IndraOcr/            the library (NuGet: IndraOCR)
   Models/Assets/         the embedded models (OpenRAIL-M, see MODEL_LICENSE)
   IndraOCR.cs            the PaddleOCR-style API
 src/IndraOcr.Cli/        indra-ocr
+src/IndraOcr.Vlm/        Chandra 2 and Surya 2 (NuGet: IndraOCR.Vlm)
+src/IndraOcr.Vlm.Cli/    indra-vlm
 tests/IndraOcr.Tests/    parity and unit tests
 tools/reference/         Python scripts that produce the reference fixtures
 .reference/              the original Python package, unchanged

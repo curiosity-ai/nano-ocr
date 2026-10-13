@@ -35,6 +35,59 @@ Not ported: `viewer.py` (a local web viewer), `bench/opb_indra.py` (OmniParseBen
 CenterMask path of `line_mask.py` (the v3.1 model set ships no `mask.onnx`), and the training-only
 helpers (`encode_targets`, vocabulary builders, label canonicalization).
 
+## Chandra 2 and Surya 2 (`src/IndraOcr.Vlm`)
+
+A second library ports Datalab's vision-language OCR: **Chandra 2** (`datalab-to/chandra-ocr-2`,
+5.3B) and **Surya 2** (`datalab-to/surya-ocr-2`, 0.69B, plus its non-VLM models). Both checkpoints
+are the same architecture, `Qwen3_5ForConditionalGeneration`, so one engine serves both. The
+Python sources are read-only checkouts of `theolivenbaum/chandra` and `theolivenbaum/surya`; as
+for Indra, **Python is the specification**, and so are the libraries it leans on
+(transformers' Qwen3.5 code and image processor, BeautifulSoup, markdownify 1.1.0, PIL, torch's
+resampling kernels).
+
+| Path | Port of |
+| --- | --- |
+| `Core/`, `Models/Attention.cs`, `Formats/SafetensorsFile.cs` | taken from the sibling PaddleOCR port: bf16-weight GEMM (`Gemm.Linear`), attention kernels, norms, memory-mapped safetensors |
+| `Models/VisionEncoder.cs` | `Qwen3_5VisionModel`: patch GEMM, bilinear (align_corners) position-table resampling in merge-block order, axial RoPE, 2×2 merger |
+| `Models/TextDecoder.cs` | `Qwen3_5TextModel`: gated delta net (causal conv, L2-normed q/k, recurrent rule, gated RMSNorm) and gated full attention (zero-centred q/k norms, partial interleaved M-RoPE, output gate); `ForwardStep` decodes a batch of sequences |
+| `Models/Qwen35Vlm.cs` | `get_rope_index`, the chat templates (Chandra's opens the turn with an empty `<think>` block), prefill, batched lockstep decoding, greedy/top-p, guided decoding hook, token log-probabilities |
+| `Models/ImageProcessor.cs`, `Imaging/PilResize.cs`, `Imaging/ScaleToFit.cs` | `smart_resize` + torchvision's uint8 antialiased bicubic (Pillow's algorithm, int16 weights at a per-axis precision), Pillow Lanczos, `scale_to_fit` |
+| `Text/HfTokenizer.cs`, `Text/WordPieceTokenizer.cs` | `tokenizer.json` pipelines: Surya's character-level WordLevel, Chandra's byte-level BPE, BERT WordPiece |
+| `Html/` | CPython's `html.parser`, bs4's html.parser tree builder and "minimal" serializer, markdownify 1.1.0, Python string semantics |
+| `Chandra/` | `chandra/{prompts,input,output}.py`, `model/hf.py`, `scripts/cli.py` |
+| `Surya/` | `inference/` (client, prompts, parsers, guided JSON), `layout/`, `recognition/`, `table_rec/`, `common/blank.py`, `ocr_error/`, `input/` |
+| `Surya/Layout/`, `Formats/TorchCheckpoint.cs` | `fast_layout/`, `common/rfdetr/` (windowed DINOv2, projector, deformable decoder), `common/order/`; a `torch.save` zip reader |
+| `Surya/Detection/` | `detection/` (EfficientViT segmentation, heatmap post-processing) |
+| `src/IndraOcr.Vlm.Cli/` | `indra-vlm chandra …` and `indra-vlm surya` (`ocr`, `layout`, `table`, `fast-layout`, `detect`) |
+
+Things that are easy to get wrong, each of which was:
+
+- **Tokenize with the file, not with transformers.** transformers 5 loads both checkpoints as its
+  own Qwen3.5 tokenizer class, which replaces Surya's character-level pipeline with the byte-level
+  one (a space becomes `Ġ`, id 2224, where the model was trained on `' '`, id 1979) and derails the
+  first tokens. vLLM and the `tokenizers` library run `tokenizer.json`'s pipeline, and so does this.
+  Chandra's file is the byte-level one, so there the two agree.
+- **Surya's server overrides the processor's pixel bounds** (`--mm-processor-kwargs` min 3136, max
+  6291456); Chandra uses the checkpoint's. `SuryaInferenceOptions` carries Surya's.
+- **The image goes through two resizes**: Pillow Lanczos in `scale_to_fit`, then torchvision's
+  uint8 bicubic in the processor. Both are byte-exact here; SkiaSharp only decodes.
+- **Guided decoding.** Surya's layout requests carry a JSON schema that vLLM enforces with
+  xgrammar; `JsonArrayConstraint` is that language as a character automaton, checked against the
+  token text in logit order (a greedy step usually tests one token).
+- **Weights stay bf16, activations are float32**, the arithmetic the reference dumps use
+  (`dump_vlm.py --dtype bf16-weights` widens on use where float32 would not fit in RAM).
+- **Batched decoding is not bit-identical to single decoding**: four or more rows reach the GEMM's
+  widened-panel kernel. Parity tests run the single path; Surya's block requests and Chandra's pages
+  decode in batches (`DecodeBatch`).
+- The VLM checkpoints (1.4 GB, 10.6 GB) are **downloaded on first use** to `~/.cache/indra-ocr`
+  (`INDRA_OCR_CACHE`, `HF_ENDPOINT`, `HF_TOKEN`), or read from a folder; they are too large to embed.
+
+Validation for this half: `VlmParityTests` (every vision block and decoder layer, both
+checkpoints, greedy tokens identical), `HtmlParityTests` (356 HTML cases through bs4, markdownify
+and both packages' parsers, string-identical), `SuryaVlmParityTests` and `ChandraPipelineTests`
+(the packages' own predictors/pipeline vs this), `SuryaLayoutParityTests`,
+`SuryaDetectionParityTests`, `SuryaOcrErrorParityTests`, `VlmUnitTests`.
+
 ## Engineering conventions
 
 - **.NET 10, C# preview.** `System.Numerics.Tensors` (`TensorPrimitives`), `Vector<T>`, x86
