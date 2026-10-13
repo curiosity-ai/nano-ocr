@@ -1,0 +1,199 @@
+using System.Globalization;
+using System.Text;
+using IndraOcr;
+using IndraOcr.Pipeline;
+
+// indra-ocr: PDFs or images in, markdown (or text, or JSON lines) out — the C# counterpart of
+// the Python `indra-ocr` command, with the same options.
+//
+//   indra-ocr paper.pdf                    # markdown to stdout
+//   indra-ocr *.pdf --out results/         # one .md per input
+//   indra-ocr scan.png --format json       # lines with boxes, confidences, timings
+return Cli.Run(args);
+
+internal static class Cli
+{
+    private const string Usage = """
+        usage: indra-ocr [options] inputs...
+
+          --out DIR             write one file per input (.md, .txt or .jsonl)
+          --format md|text|json output format (default: md)
+          --mode auto|ocr|text  auto: text layer where it passes the checks, OCR elsewhere (default);
+                                ocr: never read the text layer; text: use the text layer even when
+                                the checks fail
+          --model-order         order text-layer lines with the order model, not the PDF content order
+          --no-image-ocr        on text-layer pages, do not OCR text inside images
+          --cores N             cores to use (default: all)
+          --dpi DPI             render resolution for PDFs (default: 200)
+          --max-pages N         read at most N pages per file
+          --password PW         password of encrypted PDFs
+          --keep-furniture      keep page headers and footers in the markdown
+          --math                write math as LaTeX ($...$); slower on pages with math
+          --timings             print per-page source and time to stderr
+          --model-dir DIR       folder with the models (default: the embedded models)
+          --save-img DIR        also save each page with its blocks and lines drawn over it
+          --version             print the version
+        """;
+
+    public static int Run(string[] args)
+    {
+        var inputs = new List<string>();
+        string? outDir = null, modelDir = null, password = null, saveImg = null;
+        string format = "md";
+        var options = new IndraOcrOptions();
+        int cores = 0, maxPages = 0;
+        bool timings = false;
+        try
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                string Next() => i + 1 < args.Length ? args[++i] : throw new ArgumentException($"{a} needs a value");
+                switch (a)
+                {
+                    case "-h" or "--help":
+                        Console.WriteLine(Usage);
+                        return 0;
+                    case "--version":
+                        Console.WriteLine($"indra-ocr {typeof(IndraOCR).Assembly.GetName().Version}");
+                        return 0;
+                    case "--out": outDir = Next(); break;
+                    case "--format": format = Next(); break;
+                    case "--mode":
+                        options.Mode = Next() switch
+                        {
+                            "auto" => ConvertMode.Auto,
+                            "ocr" => ConvertMode.Ocr,
+                            "text" => ConvertMode.Text,
+                            var m => throw new ArgumentException($"--mode must be auto, ocr or text, not {m}"),
+                        };
+                        break;
+                    case "--model-order": options.PdfOrder = false; break;
+                    case "--no-image-ocr": options.ImageOcr = false; break;
+                    case "--cores" or "--threads": cores = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--dpi": options.Dpi = double.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--max-pages": maxPages = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--password": password = Next(); break;
+                    case "--keep-furniture": options.Furniture = true; break;
+                    case "--math": options.Math = true; break;
+                    case "--timings": timings = true; break;
+                    case "--model-dir": modelDir = Next(); break;
+                    case "--save-img": saveImg = Next(); options.KeepImages = true; break;
+                    default:
+                        if (a.StartsWith("--", StringComparison.Ordinal))
+                        {
+                            throw new ArgumentException($"unknown option {a}");
+                        }
+
+                        inputs.Add(a);
+                        break;
+                }
+            }
+
+            if (inputs.Count == 0)
+            {
+                throw new ArgumentException("no inputs");
+            }
+
+            if (format is not ("md" or "text" or "json"))
+            {
+                throw new ArgumentException("--format must be md, text or json");
+            }
+        }
+        catch (Exception e) when (e is ArgumentException or FormatException)
+        {
+            Console.Error.WriteLine($"indra-ocr: {e.Message}");
+            Console.Error.WriteLine(Usage);
+            return 2;
+        }
+
+        options.ModelDir = modelDir;
+        if (outDir is not null)
+        {
+            Directory.CreateDirectory(outDir);
+        }
+
+        string ext = format switch { "md" => ".md", "text" => ".txt", _ => ".jsonl" };
+        int failed = 0;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        using var ocr = new IndraOCR(options);
+        var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+
+        // One input on few pages: all cores on each page. Many pages: one page per core.
+        IEnumerable<(string Path, IReadOnlyList<OcrResult>? Results, InputException? Error)> results =
+            inputs.Count == 1 && !File.Exists(inputs[0]) is false && saveImg is null && cores != 1
+                ? ocr.PredictMany(inputs, cores, maxPages, password)
+                : inputs.Select(p => Single(ocr, p, maxPages, password));
+        foreach (var (path, pages, error) in results)
+        {
+            if (error is not null)
+            {
+                Console.Error.WriteLine($"indra-ocr: {error.Message}");
+                failed++;
+                continue;
+            }
+
+            var chunks = new List<string>();
+            foreach (OcrResult r in pages!)
+            {
+                if (r.Page.Source == PageSources.Error)
+                {
+                    Console.Error.WriteLine($"indra-ocr: {path} page {r.PageIndex + 1}: {r.Page.Note}");
+                }
+
+                chunks.Add(format switch
+                {
+                    "json" => r.ToJson(),
+                    "md" => r.Page.Markdown ?? r.Page.Text,
+                    _ => r.Page.Text,
+                });
+                if (timings)
+                {
+                    Console.Error.WriteLine($"{path} page {r.PageIndex + 1}: {r.Page.Source}, {r.Page.Timings.GetValueOrDefault("total_ms"):0} ms {r.Page.Note}");
+                }
+
+                if (saveImg is not null)
+                {
+                    r.SaveToImg(saveImg);
+                }
+            }
+
+            string body = string.Join(format == "json" ? "\n" : "\n\n", chunks) + "\n";
+            if (outDir is not null)
+            {
+                string stem = Path.GetFileNameWithoutExtension(path);
+                string name = stem;
+                for (int k = 2; names.Contains(name); k++)
+                {
+                    name = $"{stem}_{k}";
+                }
+
+                names.Add(name);
+                File.WriteAllText(Path.Combine(outDir, name + ext), body, new UTF8Encoding(false));
+            }
+            else
+            {
+                stdout.Write(body);
+            }
+        }
+
+        if (failed > 0)
+        {
+            Console.Error.WriteLine($"indra-ocr: {failed} of {inputs.Count} inputs failed");
+        }
+
+        return failed > 0 ? 1 : 0;
+    }
+
+    private static (string, IReadOnlyList<OcrResult>?, InputException?) Single(IndraOCR ocr, string path, int maxPages, string? password)
+    {
+        try
+        {
+            return (path, ocr.Predict(path, maxPages, password).ToList(), null);
+        }
+        catch (InputException e)
+        {
+            return (path, null, e);
+        }
+    }
+}
