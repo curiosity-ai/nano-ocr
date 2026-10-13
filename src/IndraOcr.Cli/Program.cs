@@ -116,12 +116,14 @@ internal static class Cli
         string ext = format switch { "md" => ".md", "text" => ".txt", _ => ".jsonl" };
         int failed = 0;
         var names = new HashSet<string>(StringComparer.Ordinal);
-        using var ocr = new IndraOCR(options);
         var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
 
-        // One input on few pages: all cores on each page. Many pages: one page per core.
+        // Pages run one per core (each single-threaded) when there are enough of them, else one at a
+        // time with every core on each — the same rule as Python's convert_many.
+        options.Threads = cores > 0 ? cores : Environment.ProcessorCount;
+        using var ocr = new IndraOCR(options);
         IEnumerable<(string Path, IReadOnlyList<OcrResult>? Results, InputException? Error)> results =
-            inputs.Count == 1 && !File.Exists(inputs[0]) is false && saveImg is null && cores != 1
+            saveImg is null
                 ? ocr.PredictMany(inputs, cores, maxPages, password)
                 : inputs.Select(p => Single(ocr, p, maxPages, password));
         foreach (var (path, pages, error) in results)

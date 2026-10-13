@@ -61,6 +61,9 @@ public sealed class IndraOcrOptions
 /// </summary>
 public sealed class IndraOCR : IDisposable
 {
+    /// <summary>Below this many pages, <see cref="PredictMany"/> puts every core on each page instead of pooling.</summary>
+    public const int MinPoolPages = 4;
+
     private readonly DocumentConverter _converter;
 
     /// <summary>Loads the models and builds the pipeline.</summary>
@@ -248,6 +251,36 @@ public sealed class IndraOCR : IDisposable
         var units = plan.Where(p => p.Error is null)
             .SelectMany(p => p.Pdf ? Enumerable.Range(0, p.Pages).Select(i => (p.Path, Index: i, p.Pdf)) : [(p.Path, Index: -1, p.Pdf)])
             .ToList();
+
+        // Few pages: one page at a time with every core on it, as Python's convert_many does
+        // below MIN_POOL_PAGES; many pages: one page per core, one kernel thread each.
+        if (units.Count < MinPoolPages || cores < 2)
+        {
+            foreach (var p in plan)
+            {
+                if (p.Error is not null)
+                {
+                    yield return (p.Path, null, p.Error);
+                    continue;
+                }
+
+                List<OcrResult>? pages = null;
+                InputException? error = null;
+                try
+                {
+                    pages = Predict(p.Path, maxPages, password).ToList();
+                }
+                catch (InputException e)
+                {
+                    error = e;
+                }
+
+                yield return (p.Path, pages, error);
+            }
+
+            yield break;
+        }
+
         var results = new ConcurrentDictionary<(string, int), object>();
         var docs = new ConcurrentDictionary<string, Lazy<PdfDocument>>();
         var single = new ParallelOptions { MaxDegreeOfParallelism = 1 };
