@@ -58,34 +58,6 @@ public static class ModelDownloader
         return directory;
     }
 
-    /// <summary>Datalab's model store, where Surya's non-VLM checkpoints live: <c>SURYA_S3_BASE_URL</c>, else https://models.datalab.to.</summary>
-    public static string DatalabEndpoint =>
-        (Environment.GetEnvironmentVariable("SURYA_S3_BASE_URL") ?? "https://models.datalab.to").TrimEnd('/');
-
-    /// <summary>
-    /// Ensures <paramref name="files"/> of a Datalab model-store checkpoint (for example
-    /// <c>ocr_error_detection/2025_02_18</c>, Surya's <c>s3://</c> checkpoints) are cached, and
-    /// returns the local directory.
-    /// </summary>
-    public static string EnsureDatalab(string remotePath, IEnumerable<string> files, Action<string, long, long>? progress = null) =>
-        EnsureFromAsync($"{DatalabEndpoint}/{remotePath}", Path.Combine(CacheRoot, "datalab", remotePath.Replace('/', Path.DirectorySeparatorChar)), files, progress)
-            .GetAwaiter().GetResult();
-
-    private static async Task<string> EnsureFromAsync(string baseUrl, string directory, IEnumerable<string> files, Action<string, long, long>? progress)
-    {
-        Directory.CreateDirectory(directory);
-        using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("indra-ocr-dotnet/0.1");
-        foreach (string file in files)
-        {
-            string target = Path.Combine(directory, file.Replace('/', Path.DirectorySeparatorChar));
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            await DownloadAsync(client, $"{baseUrl}/{file}", target, file, progress, CancellationToken.None).ConfigureAwait(false);
-        }
-
-        return directory;
-    }
-
     /// <summary>Synchronous <see cref="EnsureAsync"/>.</summary>
     public static string Ensure(string repository, IEnumerable<string> files, Action<string, long, long>? progress = null) =>
         EnsureAsync(repository, files, progress: progress).GetAwaiter().GetResult();
@@ -95,7 +67,7 @@ public static class ModelDownloader
     /// checkpoints: <c>DATALAB_MODELS_ENDPOINT</c>, else https://models.datalab.to.
     /// </summary>
     public static string DatalabEndpoint =>
-        (Environment.GetEnvironmentVariable("DATALAB_MODELS_ENDPOINT") ?? "https://models.datalab.to").TrimEnd('/');
+        (Environment.GetEnvironmentVariable("DATALAB_MODELS_ENDPOINT") ?? Environment.GetEnvironmentVariable("SURYA_S3_BASE_URL") ?? "https://models.datalab.to").TrimEnd('/');
 
     /// <summary>
     /// Ensures <paramref name="files"/> of the Datalab checkpoint at <paramref name="path"/> (for

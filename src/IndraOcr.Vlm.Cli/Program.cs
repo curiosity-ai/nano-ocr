@@ -142,6 +142,11 @@ internal static class Cli
             return RunFastLayout(o, input);
         }
 
+        if (task == "detect")
+        {
+            return RunDetect(o, input);
+        }
+
         List<int>? pages = o.Get("--page-range") is { } range ? SuryaInput.ParseRange(range) : null;
         bool folder = Directory.Exists(input);
         (List<RgbImage> images, List<string> names) = folder
@@ -225,6 +230,50 @@ internal static class Cli
 
             node["page"] = list.Count + 1;
             list.Add(node);
+        }
+
+        File.WriteAllText(Path.Combine(resultPath, "results.json"), root.ToJsonString());
+        Console.WriteLine($"Wrote results to {resultPath} ({timer.Elapsed.TotalSeconds:F1} s)");
+        return 0;
+    }
+
+    private static int RunDetect(Options o, string input)
+    {
+        List<int>? pages = o.Get("--page-range") is { } range ? SuryaInput.ParseRange(range) : null;
+        bool folder = Directory.Exists(input);
+        (List<RgbImage> images, List<string> names) = folder ? SuryaInput.LoadFolder(input, pages) : SuryaInput.LoadFile(input, pages);
+        string resultPath = ResultPath(o, input, folder);
+        string? model = o.Get("--model") ?? Environment.GetEnvironmentVariable("SURYA_DET_MODEL_DIR");
+        var detector = model is null
+            ? IndraOcr.Vlm.Surya.Detection.TextDetector.Download(Progress)
+            : IndraOcr.Vlm.Surya.Detection.TextDetector.Load(model);
+        var root = new JsonObject();
+        var timer = Stopwatch.StartNew();
+        for (int i = 0; i < images.Count; i++)
+        {
+            IndraOcr.Vlm.Surya.Detection.TextDetectionResult result = detector.Detect(images[i]);
+            var boxes = new JsonArray();
+            foreach (var box in result.Bboxes)
+            {
+                boxes.Add(new JsonObject
+                {
+                    ["polygon"] = new JsonArray(box.Polygon.Select(p => (JsonNode)new JsonArray(p[0], p[1])).ToArray()),
+                    ["confidence"] = box.Confidence,
+                    ["bbox"] = new JsonArray(box.Bbox.Select(v => (JsonNode)v).ToArray()),
+                });
+            }
+
+            if (root[names[i]] is not JsonArray list)
+            {
+                root[names[i]] = list = [];
+            }
+
+            list.Add(new JsonObject
+            {
+                ["bboxes"] = boxes,
+                ["image_bbox"] = new JsonArray(result.ImageBbox.Select(v => (JsonNode)v).ToArray()),
+                ["page"] = list.Count + 1,
+            });
         }
 
         File.WriteAllText(Path.Combine(resultPath, "results.json"), root.ToJsonString());
