@@ -137,7 +137,7 @@ public sealed class InferenceSession
             if (Profile is not null)
             {
                 double ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
-                string key = node.OpType == "Conv"
+                string key = node.OpType is "Mul" ? $"Mul {string.Join("x", args[0]!.Shape)}*{string.Join("x", args[1]!.Shape)}" : node.OpType == "Conv"
                     ? $"Conv {string.Join("x", node.Ints("kernel_shape") ?? [])} g{node.Int("group", 1)} {string.Join("x", args[0]!.Shape)}"
                     : node.OpType;
                 Profile[key] = Profile.GetValueOrDefault(key) + ms;
