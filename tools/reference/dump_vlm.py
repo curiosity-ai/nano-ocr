@@ -71,6 +71,30 @@ def scale_to_fit(img, max_size=(3072, 2048), min_size=(1792, 28), grid_size=28):
     return img.resize(new_size, resample=Image.Resampling.LANCZOS)
 
 
+def widen_on_use(model) -> None:
+    """Large Linear/Embedding weights stay bfloat16 and are widened per call; the rest go float32."""
+    import torch.nn.functional as F
+
+    def linear_forward(self, x):
+        bias = None if self.bias is None else self.bias.float()
+        return F.linear(x.float(), self.weight.float(), bias)
+
+    def embedding_forward(self, ids):
+        return F.embedding(ids, self.weight).float()
+
+    for module in model.modules():
+        if isinstance(module, torch.nn.Linear) and module.weight.numel() > 4_000_000:
+            module.forward = linear_forward.__get__(module)
+        elif isinstance(module, torch.nn.Embedding) and module.weight.numel() > 4_000_000:
+            module.forward = embedding_forward.__get__(module)
+        else:
+            for name, param in list(module.named_parameters(recurse=False)):
+                param.data = param.data.float()
+            for name, buf in list(module.named_buffers(recurse=False)):
+                if buf.is_floating_point():
+                    module._buffers[name] = buf.float()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -145,10 +169,17 @@ def main() -> None:
     arrays["grid_thw"] = inputs["image_grid_thw"].numpy().astype(np.int64)
     arrays["input_ids"] = inputs["input_ids"][0].numpy().astype(np.int64)
 
-    dtype = getattr(torch, args.dtype)
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        args.model, dtype=dtype, attn_implementation="eager"
-    )
+    if args.dtype == "bf16-weights":
+        # Too big for float32 in RAM (Chandra 2: 21 GB): keep the bfloat16 weights and compute
+        # in float32, widening each weight as it is used — the arithmetic IndraOcr.Vlm does.
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            args.model, dtype=torch.bfloat16, attn_implementation="eager"
+        )
+        widen_on_use(model)
+    else:
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            args.model, dtype=getattr(torch, args.dtype), attn_implementation="eager"
+        )
     model.eval()
     inner = model.model
     visual = inner.visual
