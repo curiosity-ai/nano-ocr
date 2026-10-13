@@ -147,18 +147,22 @@ public sealed class IndraEngine
         }
 
         double cx = sw / 2.0, cy = sh / 2.0;
-        var rotated = new float[ink.Length];
-        var rows = new float[sh];
-        var diffs = new float[Math.Max(0, sh - 1)];
 
+        // sharpness(a): the warped page's row sums (numpy's pairwise float32 sums), then the
+        // pairwise sum of their squared differences. Each row is reduced as soon as it is warped,
+        // and the angles of one search run in parallel; the first best angle wins, as max() does.
         double Sharpness(double a)
         {
-            CvWarp.WarpConstantZero(ink, sw, sh, CvWarp.RotationMatrix(cx, cy, a), rotated);
+            float[] m = CvWarp.InverseFloat(CvWarp.RotationMatrix(cx, cy, a));
+            var row = new float[sw];
+            var rows = new float[sh];
             for (int y = 0; y < sh; y++)
             {
-                rows[y] = Py.PairwiseSum(rotated.AsSpan(y * sw, sw));
+                CvWarp.WarpConstantZeroRow(ink, sw, sh, m, y, row);
+                rows[y] = Py.PairwiseSum(row);
             }
 
+            var diffs = new float[Math.Max(0, sh - 1)];
             for (int y = 0; y + 1 < sh; y++)
             {
                 float d = rows[y + 1] - rows[y];
@@ -170,18 +174,19 @@ public sealed class IndraEngine
 
         double Search(IEnumerable<double> angles)
         {
-            double best = double.NaN, bestValue = double.NegativeInfinity;
-            foreach (double a in angles)
+            double[] a = angles.ToArray();
+            var values = new double[a.Length];
+            Parallel.For(0, a.Length, Core.Parallelism.Options, i => values[i] = Sharpness(a[i]));
+            int best = 0;
+            for (int i = 1; i < a.Length; i++)
             {
-                double v = Sharpness(a);
-                if (double.IsNaN(best) || v > bestValue)
+                if (values[i] > values[best])
                 {
-                    best = a;
-                    bestValue = v;
+                    best = i;
                 }
             }
 
-            return best;
+            return a[best];
         }
 
         double coarse = Search(Arange(-DeskewMax, DeskewMax + 1e-6, 0.5));

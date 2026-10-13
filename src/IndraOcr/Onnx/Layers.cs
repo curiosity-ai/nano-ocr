@@ -125,6 +125,12 @@ internal static partial class Operators
             GemmSerial.Multiply(mg, cols, k, wg, k, col, cols, outSpan.Slice(p0), pixels, accumulate: true);
         }
 
+        if (pointwise && p.Group == 1 && n > 1 && pixels < 1024)
+        {
+            PointwiseBatched(input, weight, bias, output, n, p);
+            return;
+        }
+
         int workers = Parallelism.Workers;
         if (workers <= 1 || jobs == 1 || work < 1 << 20)
         {
@@ -156,6 +162,57 @@ internal static partial class Operators
                     ArrayPool<float>.Shared.Return(col);
                 }
             });
+    }
+
+    /// <summary>
+    /// A 1×1 convolution over a batch of short sequences (the recognizers' <c>[B, C, T]</c> with T
+    /// around a hundred) as one wide product: the batch is packed to <c>[C, B·T]</c>, multiplied,
+    /// and unpacked. Per item the product would be 128 columns wide with a scalar tail; packed it is
+    /// thousands wide and splits across every core.
+    /// </summary>
+    private static void PointwiseBatched(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p)
+    {
+        int t = p.H * p.W, c = p.C, m = p.M, cols = n * t;
+        float[] packed = System.Buffers.ArrayPool<float>.Shared.Rent(c * cols);
+        float[] product = System.Buffers.ArrayPool<float>.Shared.Rent(m * cols);
+        try
+        {
+            Parallelism.For(n, (long)c * cols, (b0, b1) =>
+            {
+                for (int b = b0; b < b1; b++)
+                {
+                    for (int ch = 0; ch < c; ch++)
+                    {
+                        Array.Copy(input, ((b * c) + ch) * t, packed, (ch * cols) + (b * t), t);
+                    }
+                }
+            });
+            Gemm.Multiply(m, cols, c, weight, c, packed, cols, product, cols);
+            Parallelism.For(n, (long)m * cols, (b0, b1) =>
+            {
+                for (int b = b0; b < b1; b++)
+                {
+                    for (int r = 0; r < m; r++)
+                    {
+                        Span<float> dst = output.AsSpan(((b * m) + r) * t, t);
+                        ReadOnlySpan<float> src = product.AsSpan((r * cols) + (b * t), t);
+                        if (bias is null)
+                        {
+                            src.CopyTo(dst);
+                        }
+                        else
+                        {
+                            TensorPrimitives.Add(src, bias[r], dst);
+                        }
+                    }
+                }
+            });
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(packed);
+            System.Buffers.ArrayPool<float>.Shared.Return(product);
+        }
     }
 
     /// <summary>Fills <c>col[k, p1-p0]</c> with the receptive fields of output pixels <c>[p0, p1)</c>.</summary>

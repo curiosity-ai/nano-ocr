@@ -266,18 +266,49 @@ public static unsafe class Gemm
     /// <summary>Transposes a row-major <c>[rows, cols]</c> matrix into <paramref name="dst"/> (<c>[cols, rows]</c>).</summary>
     public static void Transpose(ReadOnlySpan<float> src, int rows, int cols, Span<float> dst)
     {
-        const int T = 32;
-        for (int i0 = 0; i0 < rows; i0 += T)
+        fixed (float* s = src)
+        fixed (float* d = dst)
         {
-            int i1 = Math.Min(rows, i0 + T);
+            TransposeBlock(s, d, rows, cols, 0, rows);
+        }
+    }
+
+    /// <summary>Transposes <paramref name="batch"/> matrices of <c>[rows, cols]</c>, in parallel.</summary>
+    public static void TransposeBatch(float[] src, float[] dst, int batch, int rows, int cols)
+    {
+        const int T = 32;
+        int tiles = (rows + T - 1) / T;
+        int jobs = batch * tiles;
+        Parallelism.For(jobs, (long)batch * rows * cols, (j0, j1) =>
+        {
+            fixed (float* s = src)
+            fixed (float* d = dst)
+            {
+                for (int j = j0; j < j1; j++)
+                {
+                    int b = j / tiles, t = j % tiles;
+                    long off = (long)b * rows * cols;
+                    TransposeBlock(s + off, d + off, rows, cols, t * T, Math.Min(rows, (t + 1) * T));
+                }
+            }
+        });
+    }
+
+    private static void TransposeBlock(float* s, float* d, int rows, int cols, int r0, int r1)
+    {
+        const int T = 32;
+        for (int i0 = r0; i0 < r1; i0 += T)
+        {
+            int i1 = Math.Min(r1, i0 + T);
             for (int j0 = 0; j0 < cols; j0 += T)
             {
                 int j1 = Math.Min(cols, j0 + T);
                 for (int i = i0; i < i1; i++)
                 {
+                    float* srow = s + ((long)i * cols);
                     for (int j = j0; j < j1; j++)
                     {
-                        dst[(j * rows) + i] = src[(i * cols) + j];
+                        d[((long)j * rows) + i] = srow[j];
                     }
                 }
             }

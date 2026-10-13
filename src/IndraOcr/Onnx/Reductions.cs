@@ -81,18 +81,20 @@ internal static partial class Operators
         bool suffix = firstReduced >= 0 && reduce.Skip(firstReduced).All(r => r);
         if (suffix)
         {
-            ReadOnlySpan<float> src = t.Floats;
-            for (int o = 0; o < outLen; o++)
+            float[] src = t.FloatArray, dst = result.FloatArray;
+            Core.Parallelism.For(outLen, (long)t.Length, (s0, s1) =>
             {
-                ReadOnlySpan<float> row = src.Slice(o * count, count);
-                output[o] = op switch
+                for (int o = s0; o < s1; o++)
                 {
-                    ReduceOp.Max => count == 0 ? float.NegativeInfinity : TensorPrimitives.Max(row),
-                    ReduceOp.Sum => TensorPrimitives.Sum(row),
-                    _ => TensorPrimitives.Sum(row) / count,
-                };
-            }
-
+                    ReadOnlySpan<float> row = src.AsSpan(o * count, count);
+                    dst[o] = op switch
+                    {
+                        ReduceOp.Max => count == 0 ? float.NegativeInfinity : TensorPrimitives.Max(row),
+                        ReduceOp.Sum => TensorPrimitives.Sum(row),
+                        _ => TensorPrimitives.Sum(row) / count,
+                    };
+                }
+            });
             return result;
         }
 
@@ -152,6 +154,20 @@ internal static partial class Operators
         Tensor result = Tensor.Int64([.. shape]);
         float[] data = t.FloatArray;
         long[] dst = result.LongArray;
+        if (inner == 1 && !selectLast)
+        {
+            // Rows are contiguous: TensorPrimitives finds the first maximum with SIMD.
+            Core.Parallelism.For(outer, (long)outer * dim, (s0, s1) =>
+            {
+                for (int o = s0; o < s1; o++)
+                {
+                    ReadOnlySpan<float> row = data.AsSpan(o * dim, dim);
+                    dst[o] = dim == 0 ? 0 : FirstMax(row);
+                }
+            });
+            return result;
+        }
+
         for (int o = 0; o < outer; o++)
         {
             for (int i = 0; i < inner; i++)
@@ -173,6 +189,13 @@ internal static partial class Operators
         }
 
         return result;
+    }
+
+    /// <summary>The first index of the largest value (numpy's argmax; a NaN wins).</summary>
+    private static int FirstMax(ReadOnlySpan<float> row)
+    {
+        int nan = row.IndexOf(float.NaN);
+        return nan >= 0 ? nan : TensorPrimitives.IndexOfMax(row);
     }
 
     internal static Tensor Softmax(Tensor t, int axis)

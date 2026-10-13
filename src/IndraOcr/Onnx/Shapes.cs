@@ -374,14 +374,7 @@ internal static partial class Operators
             && Enumerable.Range(0, rank - 2).All(i => perm[i] == i))
         {
             int rows = x.Shape[rank - 2], cols = x.Shape[rank - 1];
-            int batch = n / (rows * cols);
-            for (int b = 0; b < batch; b++)
-            {
-                Core.Gemm.Transpose(
-                    x.FloatArray.AsSpan(b * rows * cols, rows * cols), rows, cols,
-                    result.FloatArray.AsSpan(b * rows * cols, rows * cols));
-            }
-
+            Core.Gemm.TransposeBatch(x.FloatArray, result.FloatArray, n / (rows * cols), rows, cols);
             return result;
         }
 

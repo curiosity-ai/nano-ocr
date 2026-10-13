@@ -25,8 +25,26 @@ internal static partial class Operators
         {
             Tensor result = Tensor.Float(shape);
             float[] x = a.FloatArray, y = b.FloatArray, z = result.FloatArray;
+            var runs = new List<(int O, int Ao, int As, int Bo, int Bs, int Len)>();
             Broadcast.Runs(shape, Broadcast.Strides(a.Shape, shape), Broadcast.Strides(b.Shape, shape),
-                (o, ao, ast, bo, bst, len) => FloatRun(op, x, ao, ast, y, bo, bst, z, o, len));
+                (o, ao, ast, bo, bst, len) => runs.Add((o, ao, ast, bo, bst, len)));
+            if (runs.Count == 1 && result.Length >= 1 << 16)
+            {
+                // One long run: split it so every core takes a share.
+                var r = runs[0];
+                Core.Parallelism.For(r.Len, r.Len, (s0, s1) =>
+                    FloatRun(op, x, r.Ao + (s0 * r.As), r.As, y, r.Bo + (s0 * r.Bs), r.Bs, z, r.O + s0, s1 - s0));
+                return result;
+            }
+
+            Core.Parallelism.For(runs.Count, result.Length, (s0, s1) =>
+            {
+                for (int i = s0; i < s1; i++)
+                {
+                    var r = runs[i];
+                    FloatRun(op, x, r.Ao, r.As, y, r.Bo, r.Bs, z, r.O, r.Len);
+                }
+            });
             return result;
         }
 

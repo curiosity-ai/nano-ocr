@@ -9,7 +9,7 @@ using IndraOcr.Pipeline;
 //   indra-ocr paper.pdf                    # markdown to stdout
 //   indra-ocr *.pdf --out results/         # one .md per input
 //   indra-ocr scan.png --format json       # lines with boxes, confidences, timings
-return Cli.Run(args);
+return args.Length > 0 && args[0] == "bench" ? Bench.Run(args[1..]) : args.Length > 0 && args[0] == "bench-gemm" ? GemmBench.Run() : Cli.Run(args);
 
 internal static class Cli
 {

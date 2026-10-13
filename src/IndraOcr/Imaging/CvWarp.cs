@@ -1,3 +1,5 @@
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using IndraOcr.Core;
 
 namespace IndraOcr.Imaging;
@@ -154,6 +156,136 @@ public static class CvWarp
         static float Fetch(float[] s, int w, int h, int x, int y) =>
             (uint)x < (uint)w && (uint)y < (uint)h ? s[(y * w) + x] : 0f;
     }
+
+    /// <summary>
+    /// Row <paramref name="y"/> of <see cref="WarpConstantZero"/> into <paramref name="row"/> — the
+    /// same arithmetic, one row at a time, so a caller can reduce each row while it is in cache.
+    /// </summary>
+    internal static void WarpConstantZeroRow(float[] src, int w, int h, float[] m, int y, Span<float> row)
+    {
+        float mx = (y * m[1]) + m[2];
+        float my = (y * m[4]) + m[5];
+        int x = Avx2.IsSupported && Fma.IsSupported ? GatherRow(src, w, h, m, mx, my, row) : 0;
+        for (; x < w; x++)
+        {
+            float sx = MathF.FusedMultiplyAdd(m[0], x, mx);
+            float sy = MathF.FusedMultiplyAdd(m[3], x, my);
+            float fx = MathF.Floor(sx), fy = MathF.Floor(sy);
+            int ix = (int)fx, iy = (int)fy;
+            float ax = sx - fx, ay = sy - fy;
+            float p00, p01, p10, p11;
+            if ((uint)ix < (uint)(w - 1) && (uint)iy < (uint)(h - 1))
+            {
+                int o = (iy * w) + ix;
+                p00 = src[o];
+                p01 = src[o + 1];
+                p10 = src[o + w];
+                p11 = src[o + w + 1];
+            }
+            else
+            {
+                if ((uint)(ix + 1) >= (uint)(w + 1) || (uint)(iy + 1) >= (uint)(h + 1))
+                {
+                    row[x] = 0f;
+                    continue;
+                }
+
+                p00 = Fetch(src, w, h, ix, iy);
+                p01 = Fetch(src, w, h, ix + 1, iy);
+                p10 = Fetch(src, w, h, ix, iy + 1);
+                p11 = Fetch(src, w, h, ix + 1, iy + 1);
+            }
+
+            float v0 = MathF.FusedMultiplyAdd(ax, p01 - p00, p00);
+            float v1 = MathF.FusedMultiplyAdd(ax, p11 - p10, p10);
+            row[x] = MathF.FusedMultiplyAdd(ay, v1 - v0, v0);
+        }
+
+        static float Fetch(float[] s, int w, int h, int x, int y) =>
+            (uint)x < (uint)w && (uint)y < (uint)h ? s[(y * w) + x] : 0f;
+    }
+
+    /// <summary>
+    /// Eight pixels at a time with AVX2 gathers, for the stretches where all four taps of all eight
+    /// lie inside the image; returns the first column it did not do. The arithmetic per lane is the
+    /// scalar path's (the same fused multiply-adds), so the output is identical.
+    /// </summary>
+    private static unsafe int GatherRow(float[] src, int w, int h, float[] m, float mx, float my, Span<float> row)
+    {
+        var m0 = Vector256.Create(m[0]);
+        var m3 = Vector256.Create(m[3]);
+        var vmx = Vector256.Create(mx);
+        var vmy = Vector256.Create(my);
+        var lanes = Vector256.Create(0f, 1, 2, 3, 4, 5, 6, 7);
+        var wv = Vector256.Create(w);
+        var limitX = Vector256.Create(w - 1);
+        var limitY = Vector256.Create(h - 1);
+        int x = 0;
+        fixed (float* s = src)
+        fixed (float* d = row)
+        {
+            for (; x + 8 <= w; x += 8)
+            {
+                Vector256<float> xs = Vector256.Create((float)x) + lanes;
+                Vector256<float> sx = Fma.MultiplyAdd(m0, xs, vmx);
+                Vector256<float> sy = Fma.MultiplyAdd(m3, xs, vmy);
+                Vector256<float> fx = Avx.Floor(sx), fy = Avx.Floor(sy);
+                Vector256<int> ix = Avx.ConvertToVector256Int32WithTruncation(fx);
+                Vector256<int> iy = Avx.ConvertToVector256Int32WithTruncation(fy);
+
+                // (uint)ix < w - 1 and (uint)iy < h - 1 for every lane.
+                Vector256<int> inX = Avx2.AndNot(Avx2.CompareGreaterThan(Vector256<int>.Zero, ix), Avx2.CompareGreaterThan(limitX, ix));
+                Vector256<int> inY = Avx2.AndNot(Avx2.CompareGreaterThan(Vector256<int>.Zero, iy), Avx2.CompareGreaterThan(limitY, iy));
+                if (Avx.MoveMask(Avx2.And(inX, inY).AsSingle()) != 0xFF)
+                {
+                    // Scalar for this group, then carry on vectorized.
+                    for (int k = 0; k < 8; k++)
+                    {
+                        d[x + k] = ScalarPixel(src, w, h, m, mx, my, x + k);
+                    }
+
+                    continue;
+                }
+
+                Vector256<float> ax = sx - fx, ay = sy - fy;
+                Vector256<int> o = Avx2.Add(Avx2.MultiplyLow(iy, wv), ix);
+                Vector256<float> p00 = Avx2.GatherVector256(s, o, 4);
+                Vector256<float> p01 = Avx2.GatherVector256(s + 1, o, 4);
+                Vector256<float> p10 = Avx2.GatherVector256(s + w, o, 4);
+                Vector256<float> p11 = Avx2.GatherVector256(s + w + 1, o, 4);
+                Vector256<float> v0 = Fma.MultiplyAdd(ax, p01 - p00, p00);
+                Vector256<float> v1 = Fma.MultiplyAdd(ax, p11 - p10, p10);
+                Fma.MultiplyAdd(ay, v1 - v0, v0).Store(d + x);
+            }
+        }
+
+        return x;
+    }
+
+    private static float ScalarPixel(float[] src, int w, int h, float[] m, float mx, float my, int x)
+    {
+        float sx = MathF.FusedMultiplyAdd(m[0], x, mx);
+        float sy = MathF.FusedMultiplyAdd(m[3], x, my);
+        float fx = MathF.Floor(sx), fy = MathF.Floor(sy);
+        int ix = (int)fx, iy = (int)fy;
+        float ax = sx - fx, ay = sy - fy;
+        if ((uint)(ix + 1) >= (uint)(w + 1) || (uint)(iy + 1) >= (uint)(h + 1))
+        {
+            return 0f;
+        }
+
+        float p00 = Fetch(src, w, h, ix, iy), p01 = Fetch(src, w, h, ix + 1, iy);
+        float p10 = Fetch(src, w, h, ix, iy + 1), p11 = Fetch(src, w, h, ix + 1, iy + 1);
+        float v0 = MathF.FusedMultiplyAdd(ax, p01 - p00, p00);
+        float v1 = MathF.FusedMultiplyAdd(ax, p11 - p10, p10);
+        return MathF.FusedMultiplyAdd(ay, v1 - v0, v0);
+
+        static float Fetch(float[] s, int w, int h, int x, int y) =>
+            (uint)x < (uint)w && (uint)y < (uint)h ? s[(y * w) + x] : 0f;
+    }
+
+    /// <summary>The inverse map, narrowed to float, as the warp kernels use it.</summary>
+    internal static float[] InverseFloat(double[] forward) => Narrow(Invert(forward));
 
     private static float[] Narrow(double[] m) => m.Select(v => (float)v).ToArray();
 }
