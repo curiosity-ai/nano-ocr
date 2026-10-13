@@ -30,6 +30,25 @@ public sealed record GenerationOptions
 
     /// <summary>How often <see cref="StopWhen"/> is consulted, in tokens.</summary>
     public int StopCheckInterval { get; init; } = 32;
+
+    /// <summary>
+    /// Creates a fresh output constraint for this decode (guided decoding): only tokens it accepts
+    /// are sampled, and the stop token only once it is complete.
+    /// </summary>
+    public Func<IOutputConstraint>? Constraint { get; init; }
+}
+
+/// <summary>A character-level grammar the decoded text must follow (vLLM's guided decoding).</summary>
+public interface IOutputConstraint
+{
+    /// <summary>Whether the text so far is a complete sentence of the grammar.</summary>
+    bool IsComplete { get; }
+
+    /// <summary>Whether appending <paramref name="text"/> keeps the output a valid prefix.</summary>
+    bool Accepts(string text);
+
+    /// <summary>Appends <paramref name="text"/>, which <see cref="Accepts"/> approved.</summary>
+    void Advance(string text);
 }
 
 /// <summary>One decode's output.</summary>
@@ -38,12 +57,14 @@ public sealed record GenerationOptions
 /// <param name="MeanTokenProbability">The mean probability of the generated tokens, when requested.</param>
 /// <param name="HitTokenLimit">Whether the decode stopped on <see cref="GenerationOptions.MaxNewTokens"/>.</param>
 /// <param name="Timings">Milliseconds per stage: vision, prefill, decode.</param>
+/// <param name="TokenLogprobs">Each generated token's log-probability (stop token included), when requested.</param>
 public sealed record GenerationOutput(
     string Text,
     IReadOnlyList<int> TokenIds,
     double? MeanTokenProbability,
     bool HitTokenLimit,
-    IReadOnlyDictionary<string, double> Timings);
+    IReadOnlyDictionary<string, double> Timings,
+    IReadOnlyList<double>? TokenLogprobs = null);
 
 /// <summary>
 /// A <c>Qwen3_5ForConditionalGeneration</c> checkpoint — Chandra 2 and Surya 2 are both this
@@ -245,6 +266,8 @@ public sealed class Qwen35Vlm : IDisposable
         var generated = new List<int>();
         var random = new Random(options.Seed);
         double probabilitySum = 0;
+        var logprobs = options.Logprobs ? new List<double>() : null;
+        IOutputConstraint? constraint = options.Constraint?.Invoke();
         bool hitLimit = true;
         int[] step = new int[3];
 
@@ -256,10 +279,19 @@ public sealed class Qwen35Vlm : IDisposable
                 trace?.Invoke($"gen.logits{t}", logits, logits.Length);
             }
 
-            int token = options.Temperature <= 0f ? ArgMax(logits) : Sample(logits, options.Temperature, options.TopP, random);
+            int token = constraint is not null
+                ? ConstrainedChoice(logits, constraint, options, random)
+                : options.Temperature <= 0f ? ArgMax(logits) : Sample(logits, options.Temperature, options.TopP, random);
             if (options.Logprobs)
             {
-                probabilitySum += Probability(logits, token);
+                double p = Probability(logits, token);
+                probabilitySum += p;
+                logprobs!.Add(Math.Log(p));
+            }
+
+            if (constraint is not null && Array.IndexOf(_stopTokens, token) < 0)
+            {
+                constraint.Advance(TokenText(token));
             }
 
             if (Array.IndexOf(_stopTokens, token) >= 0)
@@ -294,7 +326,118 @@ public sealed class Qwen35Vlm : IDisposable
             generated,
             options.Logprobs && scored > 0 ? probabilitySum / scored : null,
             hitLimit,
-            timings);
+            timings,
+            logprobs);
+    }
+
+    private readonly Dictionary<int, string> _tokenText = new();
+
+    /// <summary>The text one token contributes to the decoded output.</summary>
+    private string TokenText(int token)
+    {
+        lock (_tokenText)
+        {
+            if (!_tokenText.TryGetValue(token, out string? text))
+            {
+                text = Tokenizer.Decode([token], skipSpecialTokens: false);
+                _tokenText[token] = text;
+            }
+
+            return text;
+        }
+    }
+
+    /// <summary>
+    /// Guided decoding: the most likely token the grammar accepts (greedy), or a sample from the
+    /// accepted tokens' renormalised nucleus. The stop token is accepted only once the grammar is
+    /// complete. Candidates are examined in logit order, so a greedy step usually tests one.
+    /// </summary>
+    private int ConstrainedChoice(float[] logits, IOutputConstraint constraint, GenerationOptions options, Random random)
+    {
+        bool Allowed(int token) => Array.IndexOf(_stopTokens, token) >= 0
+            ? constraint.IsComplete
+            : !Tokenizer.IsSpecial(token) && constraint.Accepts(TokenText(token));
+
+        if (options.Temperature <= 0f)
+        {
+            int best = ArgMax(logits);
+            if (Allowed(best))
+            {
+                return best;
+            }
+        }
+
+        int[] order = Enumerable.Range(0, logits.Length).ToArray();
+        float[] keys = new float[logits.Length];
+        for (int i = 0; i < keys.Length; i++)
+        {
+            keys[i] = -logits[i];
+        }
+
+        Array.Sort(keys, order);
+
+        if (options.Temperature <= 0f)
+        {
+            foreach (int token in order)
+            {
+                if (Allowed(token))
+                {
+                    return token;
+                }
+            }
+
+            return _stopTokens[0];
+        }
+
+        // Sampling: softmax(logits / T) over the accepted tokens, then top-p. Tokens far below the
+        // nucleus are never examined.
+        float max = logits[order[0]] / options.Temperature;
+        var accepted = new List<(int Token, double Weight)>();
+        double total = 0;
+        foreach (int token in order)
+        {
+            double weight = Math.Exp((logits[token] / options.Temperature) - max);
+            if (weight < 1e-12 && accepted.Count > 0)
+            {
+                break;
+            }
+
+            if (Allowed(token))
+            {
+                accepted.Add((token, weight));
+                total += weight;
+            }
+        }
+
+        if (accepted.Count == 0)
+        {
+            return _stopTokens[0];
+        }
+
+        double cumulative = 0;
+        int keep = 0;
+        while (keep < accepted.Count)
+        {
+            cumulative += accepted[keep].Weight / total;
+            keep++;
+            if (cumulative >= options.TopP)
+            {
+                break;
+            }
+        }
+
+        double kept = accepted.Take(keep).Sum(a => a.Weight);
+        double draw = random.NextDouble() * kept;
+        for (int i = 0; i < keep; i++)
+        {
+            draw -= accepted[i].Weight;
+            if (draw <= 0)
+            {
+                return accepted[i].Token;
+            }
+        }
+
+        return accepted[keep - 1].Token;
     }
 
     private static int ArgMax(ReadOnlySpan<float> logits)

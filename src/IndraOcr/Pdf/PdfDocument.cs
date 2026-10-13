@@ -156,7 +156,9 @@ public sealed class PdfPage : IDisposable
     /// <c>page.render(scale=scale).to_pil().convert("RGB")</c> does: a white-filled BGR bitmap of
     /// <c>ceil(size · scale)</c> pixels with annotations drawn, returned as packed RGB.
     /// </summary>
-    public (byte[] Rgb, int Width, int Height) RenderRgb(double scale)
+    /// <param name="scale">Pixels per point.</param>
+    /// <param name="drawAnnotations">pypdfium2's <c>draw_annots</c> (Surya passes false).</param>
+    public (byte[] Rgb, int Width, int Height) RenderRgb(double scale, bool drawAnnotations = true)
     {
         int w = (int)Math.Ceiling(Width * scale), h = (int)Math.Ceiling(Height * scale);
         var rgb = new byte[w * h * 3];
@@ -171,7 +173,7 @@ public sealed class PdfPage : IDisposable
             try
             {
                 Pdfium.FPDFBitmap_FillRect(bitmap, 0, 0, w, h, 0xFFFFFFFF);
-                Pdfium.FPDF_RenderPageBitmap(bitmap, Handle, 0, 0, w, h, 0, Pdfium.FPDF_ANNOT);
+                Pdfium.FPDF_RenderPageBitmap(bitmap, Handle, 0, 0, w, h, 0, drawAnnotations ? Pdfium.FPDF_ANNOT : 0);
                 IntPtr buffer = Pdfium.FPDFBitmap_GetBuffer(bitmap);
                 int stride = Pdfium.FPDFBitmap_GetStride(bitmap);
                 var row = new byte[w * 3];
