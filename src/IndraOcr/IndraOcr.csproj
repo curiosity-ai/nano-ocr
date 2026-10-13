@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>IndraOcr</RootNamespace>
+    <AssemblyName>IndraOcr</AssemblyName>
+    <IsPackable>true</IsPackable>
+    <PackageId>IndraOCR</PackageId>
+    <Title>Indra OCR for .NET</Title>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CA1416</NoWarn>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The models ship inside the assembly: no download, no model folder to manage. -->
+    <EmbeddedResource Include="Models/Assets/*.onnx;Models/Assets/*.json" LogicalName="IndraOcr.Models.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.0" />
+    <PackageReference Include="SkiaSharp" Version="3.119.0" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="3.119.0" />
+    <PackageReference Include="bblanchon.PDFium.Linux" Version="157.0.8100" />
+    <PackageReference Include="bblanchon.PDFium.Win32" Version="157.0.8100" />
+    <PackageReference Include="bblanchon.PDFium.macOS" Version="157.0.8100" />
+  </ItemGroup>
+
+</Project>

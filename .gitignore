@@ -1,0 +1,7 @@
+bin/
+obj/
+*.user
+.vs/
+# Reference dumps are generated on demand (tools/reference); they are hundreds of MB.
+tests/data/reference/
+__pycache__/
