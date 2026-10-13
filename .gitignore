@@ -6,3 +6,4 @@ obj/
 tests/data/reference/
 __pycache__/
 tests/data/models/
+.claude/worktrees/
