@@ -68,9 +68,17 @@ public sealed class FastLayoutPredictor
     /// <summary>Stage timings of the last <see cref="Predict"/> call, in milliseconds.</summary>
     public IReadOnlyDictionary<string, double> LastTimings { get; private set; } = new Dictionary<string, double>();
 
-    /// <summary>Loads the detector from <paramref name="directory"/> and the order head from its <c>order</c> subfolder.</summary>
-    public static FastLayoutPredictor Load(string directory)
+    /// <summary>The Hub repository of the checkpoint (<c>FAST_LAYOUT_MODEL_CHECKPOINT</c>).</summary>
+    public const string Repository = "datalab-to/surya_layout2";
+
+    /// <summary>
+    /// Loads the detector from <paramref name="directory"/> and the order head from its
+    /// <c>order</c> subfolder; without a directory, <c>SURYA_LAYOUT_MODEL_DIR</c> or the download cache.
+    /// </summary>
+    public static FastLayoutPredictor Load(string? directory = null)
     {
+        directory ??= Environment.GetEnvironmentVariable("SURYA_LAYOUT_MODEL_DIR");
+        directory ??= Common.ModelDownloader.Ensure(Repository, ["config.json", "rfdetr_layout.pth", "order/config.json", "order/order_ar.pt"]);
         RfDetr detector = RfDetr.Load(directory);
         string orderDir = Path.Combine(directory, "order");
         ReadingOrderModel? order = File.Exists(Path.Combine(orderDir, "order_ar.pt")) ? ReadingOrderModel.Load(orderDir) : null;

@@ -31,7 +31,7 @@ internal static class Cli
               --no-html                    do not write the .html file
               --paginate-output            separate pages in the merged output
 
-          indra-vlm surya ocr|layout|table INPUT [options]
+          indra-vlm surya ocr|layout|table|fast-layout INPUT [options]
               --model DIR                  checkpoint folder (default: SURYA_MODEL_DIR or download to the cache)
               --output-dir DIR             default results/surya
               --page-range R               PDF pages, e.g. "0,5-10"
@@ -137,6 +137,11 @@ internal static class Cli
 
         string task = o.Positional[0];
         string input = o.Positional[1];
+        if (task == "fast-layout")
+        {
+            return RunFastLayout(o, input);
+        }
+
         List<int>? pages = o.Get("--page-range") is { } range ? SuryaInput.ParseRange(range) : null;
         bool folder = Directory.Exists(input);
         (List<RgbImage> images, List<string> names) = folder
@@ -199,6 +204,41 @@ internal static class Cli
         File.WriteAllText(Path.Combine(resultPath, "results.json"), root.ToJsonString());
         Console.WriteLine($"Wrote results to {resultPath} ({timer.Elapsed.TotalSeconds:F1} s)");
         return 0;
+    }
+
+    private static int RunFastLayout(Options o, string input)
+    {
+        List<int>? pages = o.Get("--page-range") is { } range ? SuryaInput.ParseRange(range) : null;
+        bool folder = Directory.Exists(input);
+        (List<RgbImage> images, List<string> names) = folder ? SuryaInput.LoadFolder(input, pages) : SuryaInput.LoadFile(input, pages);
+        string resultPath = ResultPath(o, input, folder);
+        var predictor = IndraOcr.Vlm.Surya.Layout.FastLayoutPredictor.Load(o.Get("--model"));
+        var root = new JsonObject();
+        var timer = Stopwatch.StartNew();
+        for (int i = 0; i < images.Count; i++)
+        {
+            JsonNode node = JsonSerializer.SerializeToNode(predictor.Predict(images[i]), SuryaJson.Default.LayoutResult)!;
+            if (root[names[i]] is not JsonArray list)
+            {
+                root[names[i]] = list = [];
+            }
+
+            node["page"] = list.Count + 1;
+            list.Add(node);
+        }
+
+        File.WriteAllText(Path.Combine(resultPath, "results.json"), root.ToJsonString());
+        Console.WriteLine($"Wrote results to {resultPath} ({timer.Elapsed.TotalSeconds:F1} s)");
+        return 0;
+    }
+
+    private static string ResultPath(Options o, string input, bool folder)
+    {
+        string path = Path.GetFullPath(Path.Combine(
+            o.Get("--output-dir") ?? Path.Combine("results", "surya"),
+            folder ? Path.GetFileName(Path.TrimEndingDirectorySeparator(input)) : Path.GetFileName(input).Split('.')[0]));
+        Directory.CreateDirectory(path);
+        return path;
     }
 
     private static void RunTables(
