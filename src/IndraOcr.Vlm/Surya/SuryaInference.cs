@@ -61,6 +61,12 @@ public sealed record SuryaInferenceOptions
 
     /// <summary><c>SURYA_INFERENCE_LOGPROBS</c>: record token probabilities (the blocks' confidence).</summary>
     public bool Logprobs { get; init; } = true;
+
+    /// <summary>
+    /// Requests decoded together (vLLM batches concurrent requests too). Each holds its caches
+    /// for the whole batch; 1 decodes one request at a time.
+    /// </summary>
+    public int DecodeBatch { get; init; } = 8;
 }
 
 /// <summary>
@@ -105,45 +111,95 @@ public sealed class SuryaInference : IDisposable
         return new SuryaInference(Qwen35Vlm.Load(modelDirectory, options.MinPixels, options.MaxPixels), options);
     }
 
-    /// <summary>Runs requests in order (<c>chat_completions_batch</c>).</summary>
-    public List<SuryaResponse> Generate(IEnumerable<SuryaRequest> batch) => batch.Select(Generate).ToList();
+    /// <summary>
+    /// <c>chat_completions_batch</c>: runs the requests (decoded <see cref="SuryaInferenceOptions.DecodeBatch"/>
+    /// at a time), then retries each failed or looping one on its own.
+    /// </summary>
+    public List<SuryaResponse> Generate(IReadOnlyList<SuryaRequest> batch)
+    {
+        var results = new SuryaResponse[batch.Count];
+        int size = Math.Max(1, Options.DecodeBatch);
+        for (int start = 0; start < batch.Count; start += size)
+        {
+            IReadOnlyList<SuryaRequest> group = batch.Skip(start).Take(size).ToList();
+            var images = group.Select(r => ScaleToFit.Apply(r.Image)).ToList();
+            try
+            {
+                List<SuryaResponse> first = GenerateOnce(images, group, Enumerable.Repeat(0, group.Count).ToList(), retry: -1);
+                for (int i = 0; i < group.Count; i++)
+                {
+                    results[start + i] = Retry(images[i], group[i], first[i]);
+                }
+            }
+            finally
+            {
+                images.ForEach(i => i.Dispose());
+            }
+        }
+
+        return [.. results];
+    }
 
     /// <summary>Runs one request with the retry policy.</summary>
-    public SuryaResponse Generate(SuryaRequest request)
+    public SuryaResponse Generate(SuryaRequest request) => Generate([request])[0];
+
+    private SuryaResponse Retry(RgbImage image, SuryaRequest request, SuryaResponse result)
     {
-        using RgbImage image = ScaleToFit.Apply(request.Image);
-        float temperature = request.Temperature ?? Options.Temperature;
-        float topP = request.TopP ?? Options.TopP;
-        SuryaResponse result = GenerateOnce(image, request, temperature, topP, seed: 0);
         for (int retries = 0; retries < Options.MaxRetries && (result.Error || RepeatDetector.HasRepeat(result.Raw)); retries++)
         {
-            float retryTemperature = Math.Min(Options.Temperature + (0.2f * (retries + 1)), 0.8f);
-            float retryTopP = result.Error ? Options.TopP : 0.95f;
-            result = GenerateOnce(image, request, retryTemperature, retryTopP, seed: retries + 1);
+            result = GenerateOnce([image], [request], [retries + 1], retries, result.Error)[0];
         }
 
         return result;
     }
 
-    private SuryaResponse GenerateOnce(RgbImage image, SuryaRequest request, float temperature, float topP, int seed)
+    /// <summary>
+    /// One decode of each request; <paramref name="retry"/> is -1 for the first attempt, else the
+    /// retry index, whose temperature is <c>0.2·(n+1)</c> (capped at 0.8) and top-p 0.95 — or the
+    /// default top-p after an error.
+    /// </summary>
+    private List<SuryaResponse> GenerateOnce(
+        IReadOnlyList<RgbImage> images,
+        IReadOnlyList<SuryaRequest> requests,
+        IReadOnlyList<int> seeds,
+        int retry,
+        bool afterError = false)
     {
-        try
+        var batch = new List<GenerationRequest>();
+        for (int i = 0; i < requests.Count; i++)
         {
-            GenerationOutput output = Model.Generate(image, request.Prompt, new GenerationOptions
+            SuryaRequest request = requests[i];
+            float temperature = retry < 0 ? request.Temperature ?? Options.Temperature : Math.Min(Options.Temperature + (0.2f * (retry + 1)), 0.8f);
+            float topP = retry < 0 ? request.TopP ?? Options.TopP : afterError ? Options.TopP : 0.95f;
+            batch.Add(new GenerationRequest(images[i], request.Prompt, new GenerationOptions
             {
                 MaxNewTokens = request.MaxTokens ?? Options.MaxTokensDefault,
                 Temperature = temperature,
                 TopP = topP,
-                Seed = seed,
+                Seed = seeds[i],
                 Logprobs = Options.Logprobs,
                 Constraint = request.Constraint,
-            });
-            int tokens = output.TokenIds.Count + (output.HitTokenLimit ? 0 : 1);
-            return new SuryaResponse(output.Text, tokens, false, output.MeanTokenProbability, output.TokenLogprobs, output.Timings);
+            }));
+        }
+
+        try
+        {
+            return Model.GenerateBatch(batch).Select(output => new SuryaResponse(
+                output.Text,
+                output.TokenIds.Count + (output.HitTokenLimit ? 0 : 1),
+                false,
+                output.MeanTokenProbability,
+                output.TokenLogprobs,
+                output.Timings)).ToList();
+        }
+        catch (Exception e) when (e is not OutOfMemoryException && requests.Count == 1)
+        {
+            return [new SuryaResponse(string.Empty, 0, true, null, null, new Dictionary<string, double>())];
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
-            return new SuryaResponse(string.Empty, 0, true, null, null, new Dictionary<string, double>());
+            // One bad request must not fail its batch: run them one by one.
+            return requests.Select((r, i) => GenerateOnce([images[i]], [r], [seeds[i]], retry, afterError)[0]).ToList();
         }
     }
 

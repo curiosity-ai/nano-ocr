@@ -51,6 +51,12 @@ public interface IOutputConstraint
     void Advance(string text);
 }
 
+/// <summary>One request of a batch: an image, a prompt and how to decode.</summary>
+/// <param name="Image">The image, already scaled by the caller's own policy.</param>
+/// <param name="Prompt">The user prompt.</param>
+/// <param name="Options">Decoding options.</param>
+public sealed record GenerationRequest(RgbImage Image, string Prompt, GenerationOptions Options);
+
 /// <summary>One decode's output.</summary>
 /// <param name="Text">The generated text, special tokens removed.</param>
 /// <param name="TokenIds">The generated ids, the stop token excluded.</param>
@@ -190,39 +196,62 @@ public sealed class Qwen35Vlm : IDisposable
         string prompt,
         GenerationOptions? options = null,
         TraceSink? trace = null,
-        StageProfile? profile = null)
+        StageProfile? profile = null) =>
+        GenerateBatch([new GenerationRequest(image, prompt, options ?? new GenerationOptions())], trace, profile)[0];
+
+    /// <summary>
+    /// Runs several requests, prefilling each and then decoding them in lockstep: one decode step
+    /// advances every unfinished sequence, so the weights — what a step is bound by — are read
+    /// once per step for the whole batch rather than once per sequence.
+    /// </summary>
+    /// <remarks>
+    /// Every sequence holds its caches for as long as the batch runs, so the batch is bounded by
+    /// memory, not by a count; callers split long lists. A batch of more than three rows reaches
+    /// the GEMM's widened-panel kernel, which groups the same products differently from the
+    /// single-row kernel, so a batched decode equals the sequence decoded alone up to float32
+    /// rounding (a greedy tie can, rarely, resolve differently).
+    /// </remarks>
+    public List<GenerationOutput> GenerateBatch(IReadOnlyList<GenerationRequest> requests, TraceSink? trace = null, StageProfile? profile = null)
     {
-        options ??= new GenerationOptions();
+        var sequences = new List<Sequence>(requests.Count);
+        try
+        {
+            foreach (GenerationRequest request in requests)
+            {
+                sequences.Add(Prefill(request, requests.Count == 1 ? trace : null, profile));
+            }
+
+            DecodeAll(sequences, trace, profile);
+            return sequences.Select(Finish).ToList();
+        }
+        finally
+        {
+            foreach (Sequence sequence in sequences)
+            {
+                sequence.State.Dispose();
+            }
+        }
+    }
+
+    private Sequence Prefill(GenerationRequest request, TraceSink? trace, StageProfile? profile)
+    {
+        GenerationOptions options = request.Options;
         var timings = new Dictionary<string, double>();
         long mark = Stopwatch.GetTimestamp();
 
-        PreprocessedImage pixels = Processor.Process(image);
+        PreprocessedImage pixels = Processor.Process(request.Image);
         trace?.Invoke("pixel_values", pixels.Pixels, pixels.Pixels.Length / pixels.PatchCount);
         float[] features = Vision.Encode(pixels, trace, profile);
         int merge = Config.SpatialMergeSize;
         int imageTokens = Vision.MergedTokens(pixels);
         timings["vision_ms"] = Stopwatch.GetElapsedTime(mark).TotalMilliseconds;
+        mark = Stopwatch.GetTimestamp();
 
-        List<int> ids = Tokenizer.Encode(BuildPrompt(prompt, imageTokens));
+        List<int> ids = Tokenizer.Encode(BuildPrompt(request.Prompt, imageTokens));
         (int[] positions, int delta) = RopeIndex(ids, pixels.GridH / merge, pixels.GridW / merge);
-        return Decode(ids, positions, delta, features, options, timings, trace, profile);
-    }
 
-    /// <summary>Prefills <paramref name="ids"/> (image features scattered in) and decodes.</summary>
-    internal GenerationOutput Decode(
-        List<int> ids,
-        int[] positions,
-        int delta,
-        float[] imageFeatures,
-        GenerationOptions options,
-        Dictionary<string, double> timings,
-        TraceSink? trace,
-        StageProfile? profile)
-    {
         int width = Config.HiddenSize;
         int n = ids.Count;
-        long mark = Stopwatch.GetTimestamp();
-
         var embeddings = new float[n * width];
         Decoder.Embed(ids.ToArray(), embeddings);
         int feature = 0;
@@ -230,18 +259,18 @@ public sealed class Qwen35Vlm : IDisposable
         {
             if (ids[i] == Config.ImageTokenId)
             {
-                imageFeatures.AsSpan(feature * width, width).CopyTo(embeddings.AsSpan(i * width, width));
+                features.AsSpan(feature * width, width).CopyTo(embeddings.AsSpan(i * width, width));
                 feature++;
             }
         }
 
         trace?.Invoke("txt.embeds", embeddings, width);
 
-        using DecoderState state = Decoder.CreateState(n + Math.Min(options.MaxNewTokens, 4096));
+        DecoderState state = Decoder.CreateState(n + Math.Min(options.MaxNewTokens, 4096));
         state.RopeDelta = delta;
 
         // Prefill in chunks; the trace sees the whole prompt only when it fits in one.
-        float[] last = new float[width];
+        var last = new float[width];
         for (int start = 0; start < n; start += PrefillChunk)
         {
             int count = Math.Min(PrefillChunk, n - start);
@@ -260,74 +289,158 @@ public sealed class Qwen35Vlm : IDisposable
         }
 
         timings["prefill_ms"] = Stopwatch.GetElapsedTime(mark).TotalMilliseconds;
-        mark = Stopwatch.GetTimestamp();
-
-        var logits = new float[Config.VocabSize];
-        var generated = new List<int>();
-        var random = new Random(options.Seed);
-        double probabilitySum = 0;
-        var logprobs = options.Logprobs ? new List<double>() : null;
-        IOutputConstraint? constraint = options.Constraint?.Invoke();
-        bool hitLimit = true;
-        int[] step = new int[3];
-
-        for (int t = 0; t < options.MaxNewTokens; t++)
+        return new Sequence(options, state, last, timings)
         {
-            Decoder.Logits(last, 1, logits);
-            if (t < 4)
-            {
-                trace?.Invoke($"gen.logits{t}", logits, logits.Length);
-            }
+            Constraint = options.Constraint?.Invoke(),
+            Random = new Random(options.Seed),
+            Logprobs = options.Logprobs ? [] : null,
+        };
+    }
 
-            int token = constraint is not null
-                ? ConstrainedChoice(logits, constraint, options, random)
-                : options.Temperature <= 0f ? ArgMax(logits) : Sample(logits, options.Temperature, options.TopP, random);
-            if (options.Logprobs)
-            {
-                double p = Probability(logits, token);
-                probabilitySum += p;
-                logprobs!.Add(Math.Log(p));
-            }
-
-            if (constraint is not null && Array.IndexOf(_stopTokens, token) < 0)
-            {
-                constraint.Advance(TokenText(token));
-            }
-
-            if (Array.IndexOf(_stopTokens, token) >= 0)
-            {
-                hitLimit = false;
-                break;
-            }
-
-            generated.Add(token);
-            if (options.StopWhen is not null && generated.Count % options.StopCheckInterval == 0
-                && options.StopWhen(Tokenizer.Decode(generated)))
-            {
-                hitLimit = false;
-                break;
-            }
-
-            if (t + 1 == options.MaxNewTokens)
-            {
-                break;
-            }
-
-            Decoder.Embed([token], last);
-            int position = state.Length + state.RopeDelta;
-            step[0] = step[1] = step[2] = position;
-            Decoder.Forward(last, 1, step, state, profile: profile);
+    private void DecodeAll(List<Sequence> sequences, TraceSink? trace, StageProfile? profile)
+    {
+        int width = Config.HiddenSize;
+        int vocab = Config.VocabSize;
+        long mark = Stopwatch.GetTimestamp();
+        var active = sequences.Where(s => s.Options.MaxNewTokens > 0).ToList();
+        foreach (Sequence s in sequences.Except(active))
+        {
+            s.Done = true;
         }
 
-        timings["decode_ms"] = Stopwatch.GetElapsedTime(mark).TotalMilliseconds;
-        int scored = generated.Count + (hitLimit ? 0 : 1);
+        var hidden = new float[active.Count * width];
+        for (int i = 0; i < active.Count; i++)
+        {
+            active[i].Last.CopyTo(hidden.AsSpan(i * width, width));
+        }
+
+        var logits = new float[active.Count * vocab];
+        for (int step = 0; active.Count > 0; step++)
+        {
+            Decoder.Logits(hidden, active.Count, logits);
+            var next = new List<Sequence>(active.Count);
+            var tokens = new List<int>(active.Count);
+            for (int i = 0; i < active.Count; i++)
+            {
+                Sequence s = active[i];
+                float[] row = logits.AsSpan(i * vocab, vocab).ToArray();
+                if (step < 4 && sequences.Count == 1)
+                {
+                    trace?.Invoke($"gen.logits{step}", row, vocab);
+                }
+
+                if (Choose(s, row) is { } token)
+                {
+                    next.Add(s);
+                    tokens.Add(token);
+                }
+            }
+
+            active = next;
+            if (active.Count == 0)
+            {
+                break;
+            }
+
+            hidden = new float[active.Count * width];
+            var positions = new int[active.Count];
+            for (int i = 0; i < active.Count; i++)
+            {
+                Decoder.Embed([tokens[i]], hidden.AsSpan(i * width, width));
+                positions[i] = active[i].State.Length + active[i].State.RopeDelta;
+            }
+
+            Decoder.ForwardStep(hidden, active.Count, positions, active.Select(s => s.State).ToArray(), profile);
+            logits = new float[active.Count * vocab];
+        }
+
+        double elapsed = Stopwatch.GetElapsedTime(mark).TotalMilliseconds;
+        foreach (Sequence s in sequences)
+        {
+            s.Timings["decode_ms"] = elapsed;
+        }
+    }
+
+    /// <summary>
+    /// Picks the next token of <paramref name="s"/> from its logits and records it. Returns the
+    /// token when the sequence goes on, or null when it has finished.
+    /// </summary>
+    private int? Choose(Sequence s, float[] logits)
+    {
+        GenerationOptions options = s.Options;
+        int token = s.Constraint is not null
+            ? ConstrainedChoice(logits, s.Constraint, options, s.Random)
+            : options.Temperature <= 0f ? ArgMax(logits) : Sample(logits, options.Temperature, options.TopP, s.Random);
+        if (options.Logprobs)
+        {
+            double p = Probability(logits, token);
+            s.ProbabilitySum += p;
+            s.Logprobs!.Add(Math.Log(p));
+        }
+
+        bool stop = Array.IndexOf(_stopTokens, token) >= 0;
+        if (stop)
+        {
+            s.HitLimit = false;
+            s.Done = true;
+            return null;
+        }
+
+        s.Constraint?.Advance(TokenText(token));
+        s.Generated.Add(token);
+        if (options.StopWhen is not null && s.Generated.Count % options.StopCheckInterval == 0
+            && options.StopWhen(Tokenizer.Decode(s.Generated)))
+        {
+            s.HitLimit = false;
+            s.Done = true;
+            return null;
+        }
+
+        if (s.Generated.Count >= options.MaxNewTokens)
+        {
+            s.Done = true;
+            return null;
+        }
+
+        return token;
+    }
+
+    private GenerationOutput Finish(Sequence s)
+    {
+        int scored = s.Generated.Count + (s.HitLimit ? 0 : 1);
         return new GenerationOutput(
-            Tokenizer.Decode(generated),
-            generated,
-            options.Logprobs && scored > 0 ? probabilitySum / scored : null,
-            hitLimit,
-            timings,
-            logprobs);
+            Tokenizer.Decode(s.Generated),
+            s.Generated,
+            s.Options.Logprobs && scored > 0 ? s.ProbabilitySum / scored : null,
+            s.HitLimit,
+            s.Timings,
+            s.Logprobs);
+    }
+
+    /// <summary>One sequence of a batch.</summary>
+    private sealed class Sequence(GenerationOptions options, DecoderState state, float[] last, Dictionary<string, double> timings)
+    {
+        public GenerationOptions Options { get; } = options;
+
+        public DecoderState State { get; } = state;
+
+        public float[] Last { get; } = last;
+
+        public Dictionary<string, double> Timings { get; } = timings;
+
+        public List<int> Generated { get; } = [];
+
+        public required Random Random { get; init; }
+
+        public IOutputConstraint? Constraint { get; init; }
+
+        public List<double>? Logprobs { get; init; }
+
+        public double ProbabilitySum { get; set; }
+
+        public bool HitLimit { get; set; } = true;
+
+        public bool Done { get; set; }
     }
 
     private readonly Dictionary<int, string> _tokenText = new();

@@ -41,19 +41,19 @@ public sealed class SuryaLayoutPredictor(SuryaInference inference)
             throw new ArgumentException("target_image_sizes must match images length");
         }
 
+        List<SuryaResponse> outputs = inference.Generate(images.Select(image => new SuryaRequest
+        {
+            Image = image,
+            Prompt = SuryaPrompts.Layout,
+            MaxTokens = MaxTokens,
+            Constraint = Guided ? JsonArrayConstraint.SuryaLayout : null,
+        }).ToList());
+
         var results = new List<LayoutResult>();
         for (int index = 0; index < images.Count; index++)
         {
-            RgbImage image = images[index];
-            SuryaResponse output = inference.Generate(new SuryaRequest
-            {
-                Image = image,
-                Prompt = SuryaPrompts.Layout,
-                MaxTokens = MaxTokens,
-                Constraint = Guided ? JsonArrayConstraint.SuryaLayout : null,
-            });
-            (int w, int h) = targetSizes?[index] ?? (image.Width, image.Height);
-            results.Add(Parse(image, output, w, h));
+            (int w, int h) = targetSizes?[index] ?? (images[index].Width, images[index].Height);
+            results.Add(Parse(images[index], outputs[index], w, h));
         }
 
         return results;
@@ -156,6 +156,36 @@ public sealed class SuryaRecognitionPredictor(SuryaInference inference)
             throw new ArgumentException($"images and layout_results must be same length ({images.Count} vs {layouts.Count})");
         }
 
+        List<SuryaResponse> outputs;
+
+        // One flat batch across all pages, as upstream builds it for its concurrent requests.
+        var requests = new List<SuryaRequest>();
+        var crops = new List<RgbImage>();
+        try
+        {
+            for (int page = 0; page < images.Count; page++)
+            {
+                foreach (LayoutBox box in layouts[page].Bboxes.Where(b => !SuryaPrompts.SkipCanonicalLabels.Contains(b.Label)))
+                {
+                    RgbImage crop = CropBlock(images[page], box.Polygon);
+                    crops.Add(crop);
+                    requests.Add(new SuryaRequest
+                    {
+                        Image = crop,
+                        Prompt = SuryaPrompts.Block,
+                        MaxTokens = SuryaPrompts.ImageTokenBudget(box.Count, MaxTokensBlockCeiling),
+                    });
+                }
+            }
+
+            outputs = requests.Count > 0 ? inference.Generate(requests) : [];
+        }
+        finally
+        {
+            crops.ForEach(c => c.Dispose());
+        }
+
+        int next = 0;
         var results = new List<PageOcrResult>();
         for (int page = 0; page < images.Count; page++)
         {
@@ -173,13 +203,7 @@ public sealed class SuryaRecognitionPredictor(SuryaInference inference)
                     continue;
                 }
 
-                using RgbImage crop = CropBlock(image, box.Polygon);
-                SuryaResponse output = inference.Generate(new SuryaRequest
-                {
-                    Image = crop,
-                    Prompt = SuryaPrompts.Block,
-                    MaxTokens = SuryaPrompts.ImageTokenBudget(box.Count, MaxTokensBlockCeiling),
-                });
+                SuryaResponse output = outputs[next++];
 
                 blocks.Add(output.Error
                     ? new BlockOcrResult
@@ -223,17 +247,18 @@ public sealed class SuryaRecognitionPredictor(SuryaInference inference)
         for (int round = 0; round < rounds.Length && pending.Count > 0; round++)
         {
             var still = new List<int>();
-            foreach (int i in pending)
+            List<SuryaResponse> outputs = inference.Generate(pending.Select(i => new SuryaRequest
             {
-                SuryaResponse output = inference.Generate(new SuryaRequest
-                {
-                    Image = images[i],
-                    Prompt = SuryaPrompts.HighAccuracyBbox,
-                    MaxTokens = MaxTokensFullPage,
-                    Temperature = round > 0 ? rounds[round].Temperature : null,
-                    TopP = rounds[round].TopP,
-                });
-                PageOcrResult? page = BuildPage(output, images[i]);
+                Image = images[i],
+                Prompt = SuryaPrompts.HighAccuracyBbox,
+                MaxTokens = MaxTokensFullPage,
+                Temperature = round > 0 ? rounds[round].Temperature : null,
+                TopP = rounds[round].TopP,
+            }).ToList());
+            for (int k = 0; k < pending.Count; k++)
+            {
+                int i = pending[k];
+                PageOcrResult? page = BuildPage(outputs[k], images[i]);
                 if (page is not null)
                 {
                     results[i] = page;
@@ -357,20 +382,14 @@ public sealed class SuryaTableRecPredictor(SuryaInference inference)
     /// <summary><c>predict_simple</c>.</summary>
     public List<TableResult> PredictSimple(IReadOnlyList<RgbImage> images)
     {
-        var results = new List<TableResult>();
-        foreach (RgbImage image in images)
+        List<SuryaResponse> outputs = inference.Generate(images.Select(image => new SuryaRequest
         {
-            SuryaResponse output = inference.Generate(new SuryaRequest
-            {
-                Image = image,
-                Prompt = SuryaPrompts.TableRec,
-                MaxTokens = MaxTokens,
-                Constraint = Guided ? JsonArrayConstraint.SuryaTableRec : null,
-            });
-            results.Add(ParseSimple(output, image.Width, image.Height));
-        }
-
-        return results;
+            Image = image,
+            Prompt = SuryaPrompts.TableRec,
+            MaxTokens = MaxTokens,
+            Constraint = Guided ? JsonArrayConstraint.SuryaTableRec : null,
+        }).ToList());
+        return images.Select((image, i) => ParseSimple(outputs[i], image.Width, image.Height)).ToList();
     }
 
     /// <summary>The parsing half of <c>predict_simple</c>.</summary>
@@ -432,17 +451,17 @@ public sealed class SuryaTableRecPredictor(SuryaInference inference)
     /// <summary><c>predict_full</c>: the block prompt on the table crop.</summary>
     public List<TableResult> PredictFull(IReadOnlyList<RgbImage> images, IReadOnlyList<int>? counts = null)
     {
+        List<SuryaResponse> outputs = inference.Generate(images.Select((image, i) => new SuryaRequest
+        {
+            Image = image,
+            Prompt = SuryaPrompts.Block,
+            MaxTokens = SuryaPrompts.ImageTokenBudget(counts?[i] ?? 0, MaxTokensBlockCeiling, floor: 1024),
+        }).ToList());
         var results = new List<TableResult>();
         for (int i = 0; i < images.Count; i++)
         {
             RgbImage image = images[i];
-            int count = counts?[i] ?? 0;
-            SuryaResponse output = inference.Generate(new SuryaRequest
-            {
-                Image = image,
-                Prompt = SuryaPrompts.Block,
-                MaxTokens = SuryaPrompts.ImageTokenBudget(count, MaxTokensBlockCeiling, floor: 1024),
-            });
+            SuryaResponse output = outputs[i];
             double[] pageBox = [0, 0, image.Width, image.Height];
             results.Add(output.Error
                 ? new TableResult { Rows = [], Cols = [], Cells = [], ImageBbox = pageBox, Raw = output.Raw, Mode = "full", Error = true }

@@ -44,6 +44,12 @@ public sealed record ChandraOptions
 
     /// <summary><c>MIN_IMAGE_DIM</c>.</summary>
     public int MinImageDim { get; init; } = 1536;
+
+    /// <summary>
+    /// Pages decoded together. Decoding reads every weight once per step, so stepping several
+    /// pages at once multiplies throughput; each page holds its caches meanwhile.
+    /// </summary>
+    public int DecodeBatch { get; init; } = 4;
 }
 
 /// <summary>One page's result (<c>chandra.model.schema.BatchOutputItem</c>).</summary>
@@ -177,23 +183,46 @@ public sealed class ChandraOcr : IDisposable
     }
 
     /// <summary>Runs one page image through the model and parses the result.</summary>
-    public ChandraPage Predict(RgbImage page)
+    public ChandraPage Predict(RgbImage page) => PredictBatch([page])[0];
+
+    /// <summary>Runs page images through the model, decoding them together, and parses the results.</summary>
+    public List<ChandraPage> PredictBatch(IReadOnlyList<RgbImage> pages)
     {
         string prompt = Options.Prompt ?? ChandraPrompts.ForType(Options.PromptType);
-        using RgbImage scaled = ScaleToFit.Apply(page);
-
-        GenerationOutput output = _model.Generate(scaled, prompt, new GenerationOptions { MaxNewTokens = Options.MaxOutputTokens });
-        for (int retry = 0; retry < Options.MaxRetries && RepeatDetector.HasRepeat(output.Text); retry++)
+        var scaled = pages.Select(ScaleToFit.Apply).ToList();
+        try
         {
-            output = _model.Generate(scaled, prompt, new GenerationOptions
+            List<GenerationOutput> outputs = _model.GenerateBatch(scaled
+                .Select(image => new GenerationRequest(image, prompt, new GenerationOptions { MaxNewTokens = Options.MaxOutputTokens }))
+                .ToList());
+            var results = new List<ChandraPage>();
+            for (int p = 0; p < pages.Count; p++)
             {
-                MaxNewTokens = Options.MaxOutputTokens,
-                Temperature = Math.Min(0.2f * (retry + 1), 0.8f),
-                TopP = 0.95f,
-                Seed = retry + 1,
-            });
-        }
+                GenerationOutput output = outputs[p];
+                for (int retry = 0; retry < Options.MaxRetries && RepeatDetector.HasRepeat(output.Text); retry++)
+                {
+                    output = _model.Generate(scaled[p], prompt, new GenerationOptions
+                    {
+                        MaxNewTokens = Options.MaxOutputTokens,
+                        Temperature = Math.Min(0.2f * (retry + 1), 0.8f),
+                        TopP = 0.95f,
+                        Seed = retry + 1,
+                    });
+                }
 
+                results.Add(Parse(pages[p], output));
+            }
+
+            return results;
+        }
+        finally
+        {
+            scaled.ForEach(i => i.Dispose());
+        }
+    }
+
+    private ChandraPage Parse(RgbImage page, GenerationOutput output)
+    {
         string raw = output.Text;
         List<LayoutBlock> chunks = ChandraOutput.ParseLayout(raw, page.Width, page.Height, Options.BboxScale);
         return new ChandraPage
@@ -209,22 +238,23 @@ public sealed class ChandraOcr : IDisposable
         };
     }
 
-    /// <summary>Runs every page of a file.</summary>
+    /// <summary>Runs every page of a file, <see cref="ChandraOptions.DecodeBatch"/> pages at a time.</summary>
     public List<ChandraPage> PredictFile(string path, IReadOnlyCollection<int>? pages = null, Action<int, int>? onPage = null)
     {
         List<RgbImage> images = LoadFile(path, pages);
         var results = new List<ChandraPage>();
-        for (int i = 0; i < images.Count; i++)
+        int size = Math.Max(1, Options.DecodeBatch);
+        try
         {
-            onPage?.Invoke(i, images.Count);
-            try
+            for (int start = 0; start < images.Count; start += size)
             {
-                results.Add(Predict(images[i]));
+                onPage?.Invoke(start, images.Count);
+                results.AddRange(PredictBatch(images.Skip(start).Take(size).ToList()));
             }
-            finally
-            {
-                images[i].Dispose();
-            }
+        }
+        finally
+        {
+            images.ForEach(i => i.Dispose());
         }
 
         return results;

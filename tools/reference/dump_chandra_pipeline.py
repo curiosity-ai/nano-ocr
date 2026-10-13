@@ -54,7 +54,7 @@ def main() -> None:
         source = cropped
 
     def load_model():
-        model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.bfloat16, attn_implementation="eager")
+        model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.bfloat16, attn_implementation="sdpa")
         widen_on_use(model)
         model = model.eval()
         processor = AutoProcessor.from_pretrained(args.model)

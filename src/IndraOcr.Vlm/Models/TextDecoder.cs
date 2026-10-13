@@ -212,6 +212,216 @@ public sealed class TextDecoder
         trace?.Invoke("txt.norm", hidden.Span[..(count * width)], width);
     }
 
+    /// <summary>
+    /// One decode step for several sequences at once: row <c>b</c> of <paramref name="hidden"/>
+    /// is the next token of <paramref name="states"/>[b], at M-RoPE position
+    /// <paramref name="positions"/>[b] on all three axes. The matrix products run over all rows
+    /// together, so the weights — what a decode step is bound by — are read once for the batch.
+    /// The output is the final-normed hidden state of each row.
+    /// </summary>
+    public void ForwardStep(Memory<float> hidden, int batch, ReadOnlySpan<int> positions, DecoderState[] states, StageProfile? profile = null)
+    {
+        int width = _config.HiddenSize;
+        int rotary = _config.RotaryDim;
+        int half = rotary / 2;
+        foreach (DecoderState state in states.AsSpan(0, batch))
+        {
+            state.Reserve(1);
+        }
+
+        float[] cos = new float[batch * rotary];
+        float[] sin = new float[batch * rotary];
+        for (int b = 0; b < batch; b++)
+        {
+            for (int i = 0; i < half; i++)
+            {
+                float angle = positions[b] * _inverseFrequency[i];
+                cos[(b * rotary) + i] = cos[(b * rotary) + i + half] = MathF.Cos(angle);
+                sin[(b * rotary) + i] = sin[(b * rotary) + i + half] = MathF.Sin(angle);
+            }
+        }
+
+        int inner = _config.IntermediateSize;
+        using PooledBuffer normed = TensorPool.Rent(batch * width);
+        using PooledBuffer mixed = TensorPool.Rent(batch * width);
+        using PooledBuffer gate = TensorPool.Rent(batch * inner);
+        using PooledBuffer up = TensorPool.Rent(batch * inner);
+        Memory<float> rows = hidden[..(batch * width)];
+
+        for (int index = 0; index < _layers.Length; index++)
+        {
+            Layer layer = _layers[index];
+            rows.Span.CopyTo(normed.Span);
+            Norms.RmsNorm(normed.Span[..(batch * width)], width, layer.InputNorm, _config.RmsNormEps);
+
+            if (layer.IsLinear)
+            {
+                LinearAttentionStep(layer, index, normed.Memory, batch, states, mixed.Memory, profile);
+            }
+            else
+            {
+                FullAttentionStep(layer, index, normed.Memory, batch, states, cos, sin, mixed.Memory, profile);
+            }
+
+            Kernels.AddInPlace(rows.Span, mixed.Span[..(batch * width)]);
+            rows.Span.CopyTo(normed.Span);
+            Norms.RmsNorm(normed.Span[..(batch * width)], width, layer.PostNorm, _config.RmsNormEps);
+
+            using (profile?.Measure("mlp gemm"))
+            {
+                Gemm.Linear(normed.Memory, batch, width, layer.Gate, default, gate.Memory, inner);
+                Gemm.Linear(normed.Memory, batch, width, layer.Up, default, up.Memory, inner);
+                Kernels.Silu(gate.Span[..(batch * inner)]);
+                Kernels.MultiplyInPlace(gate.Span[..(batch * inner)], up.Span[..(batch * inner)]);
+                Gemm.Linear(gate.Memory, batch, inner, layer.Down, default, mixed.Memory, width);
+            }
+
+            Kernels.AddInPlace(rows.Span, mixed.Span[..(batch * width)]);
+        }
+
+        foreach (DecoderState state in states.AsSpan(0, batch))
+        {
+            state.Length += 1;
+        }
+
+        Norms.RmsNorm(rows.Span, width, _finalNorm, _config.RmsNormEps);
+    }
+
+    private void LinearAttentionStep(Layer layer, int index, ReadOnlyMemory<float> normed, int batch, DecoderState[] states, Memory<float> output, StageProfile? profile)
+    {
+        int width = _config.HiddenSize;
+        int keyDim = _config.LinearKeyDim;
+        int valueDim = _config.LinearValueDim;
+        int convDim = (2 * keyDim) + valueDim;
+        int valueHeads = _config.LinearValueHeads;
+        int keyHeadDim = _config.LinearKeyHeadDim;
+        int valueHeadDim = _config.LinearValueHeadDim;
+        int repeat = valueHeads / _config.LinearKeyHeads;
+
+        using PooledBuffer qkv = TensorPool.Rent(batch * convDim);
+        using PooledBuffer z = TensorPool.Rent(batch * valueDim);
+        using PooledBuffer b = TensorPool.Rent(batch * valueHeads);
+        using PooledBuffer a = TensorPool.Rent(batch * valueHeads);
+        using PooledBuffer convolved = TensorPool.Rent(batch * convDim);
+        using PooledBuffer core = TensorPool.Rent(batch * valueDim);
+
+        using (profile?.Measure("linear gemm"))
+        {
+            Gemm.Linear(normed, batch, width, layer.InProjQkv, default, qkv.Memory, convDim);
+            Gemm.Linear(normed, batch, width, layer.InProjZ, default, z.Memory, valueDim);
+            Gemm.Linear(normed, batch, width, layer.InProjB, default, b.Memory, valueHeads);
+            Gemm.Linear(normed, batch, width, layer.InProjA, default, a.Memory, valueHeads);
+        }
+
+        using (profile?.Measure("delta rule"))
+        {
+            for (int s = 0; s < batch; s++)
+            {
+                CausalConv(layer.ConvWeight, states[s].ConvHistory[index], qkv.Memory.Slice(s * convDim, convDim), convolved.Memory.Slice(s * convDim, convDim), 1, convDim);
+            }
+
+            float scale = 1f / MathF.Sqrt(keyHeadDim);
+            ReadOnlyMemory<float> conv = convolved.Memory;
+            ReadOnlyMemory<float> bMemory = b.Memory;
+            ReadOnlyMemory<float> aMemory = a.Memory;
+            Memory<float> coreMemory = core.Memory;
+            Parallel.For(0, batch * valueHeads, Parallelism.Options, item =>
+            {
+                int s = item / valueHeads;
+                int head = item % valueHeads;
+                DeltaRuleHead(
+                    layer, head, head / repeat, 1, conv.Span.Slice(s * convDim, convDim), convDim, keyDim, keyHeadDim, valueHeadDim,
+                    bMemory.Span.Slice(s * valueHeads, valueHeads), aMemory.Span.Slice(s * valueHeads, valueHeads), valueHeads, scale,
+                    states[s].Recurrent[index].AsSpan(head * keyHeadDim * valueHeadDim, keyHeadDim * valueHeadDim),
+                    coreMemory.Span.Slice(s * valueDim, valueDim), valueDim);
+            });
+
+            GatedNorm(core.Span[..(batch * valueDim)], z.Span[..(batch * valueDim)], layer.GatedNorm, _config.RmsNormEps);
+        }
+
+        using (profile?.Measure("linear gemm"))
+        {
+            Gemm.Linear(core.Memory, batch, valueDim, layer.OutProj, default, output, width);
+        }
+    }
+
+    private void FullAttentionStep(Layer layer, int index, ReadOnlyMemory<float> normed, int batch, DecoderState[] states, float[] cos, float[] sin, Memory<float> output, StageProfile? profile)
+    {
+        int width = _config.HiddenSize;
+        int heads = _config.NumHeads;
+        int kvHeads = _config.NumKeyValueHeads;
+        int headDim = _config.HeadDim;
+        int rotary = _config.RotaryDim;
+        int queryWidth = heads * headDim;
+        int kvWidth = kvHeads * headDim;
+        float eps = _config.RmsNormEps;
+
+        using PooledBuffer queryGate = TensorPool.Rent(batch * 2 * queryWidth);
+        using PooledBuffer keys = TensorPool.Rent(batch * kvWidth);
+        using PooledBuffer values = TensorPool.Rent(batch * kvWidth);
+        using PooledBuffer queries = TensorPool.Rent(batch * queryWidth);
+        using PooledBuffer attention = TensorPool.Rent(batch * queryWidth);
+
+        using (profile?.Measure("attn gemm"))
+        {
+            Gemm.Linear(normed, batch, width, layer.QProj!.Value, default, queryGate.Memory, 2 * queryWidth);
+            Gemm.Linear(normed, batch, width, layer.KProj!.Value, default, keys.Memory, kvWidth);
+            Gemm.Linear(normed, batch, width, layer.VProj!.Value, default, values.Memory, kvWidth);
+        }
+
+        using (profile?.Measure("attention"))
+        {
+            for (int s = 0; s < batch; s++)
+            {
+                ReadOnlySpan<float> c = cos.AsSpan(s * rotary, rotary);
+                ReadOnlySpan<float> si = sin.AsSpan(s * rotary, rotary);
+                for (int h = 0; h < heads; h++)
+                {
+                    Span<float> q = queries.Span.Slice((s * queryWidth) + (h * headDim), headDim);
+                    queryGate.Span.Slice((s * 2 * queryWidth) + (h * 2 * headDim), headDim).CopyTo(q);
+                    Norms.RmsNorm(q, headDim, layer.QNorm, eps);
+                    Rotary.ApplyPartial(q, c, si);
+                }
+
+                DecoderState state = states[s];
+                int past = state.Length;
+                Span<float> cacheKeys = state.Keys[index].AsSpan(past * kvWidth, kvWidth);
+                keys.Span.Slice(s * kvWidth, kvWidth).CopyTo(cacheKeys);
+                values.Span.Slice(s * kvWidth, kvWidth).CopyTo(state.Values[index].AsSpan(past * kvWidth, kvWidth));
+                for (int h = 0; h < kvHeads; h++)
+                {
+                    Span<float> k = cacheKeys.Slice(h * headDim, headDim);
+                    Norms.RmsNorm(k, headDim, layer.KNorm, eps);
+                    Rotary.ApplyPartial(k, c, si);
+                }
+
+                CausalAttention(
+                    queries.Memory.Slice(s * queryWidth, queryWidth), state.Keys[index], state.Values[index], past, 1,
+                    heads, kvHeads, headDim, attention.Memory.Slice(s * queryWidth, queryWidth));
+            }
+
+            Span<float> att = attention.Span;
+            ReadOnlySpan<float> qg = queryGate.Span;
+            for (int s = 0; s < batch; s++)
+            {
+                for (int h = 0; h < heads; h++)
+                {
+                    Span<float> row = att.Slice((s * queryWidth) + (h * headDim), headDim);
+                    ReadOnlySpan<float> g = qg.Slice((s * 2 * queryWidth) + (h * 2 * headDim) + headDim, headDim);
+                    for (int i = 0; i < headDim; i++)
+                    {
+                        row[i] *= 1f / (1f + MathF.Exp(-g[i]));
+                    }
+                }
+            }
+        }
+
+        using (profile?.Measure("attn gemm"))
+        {
+            Gemm.Linear(attention.Memory, batch, queryWidth, layer.OProj!.Value, default, output, width);
+        }
+    }
+
     private void LinearAttention(
         Layer layer,
         int index,
