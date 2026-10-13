@@ -151,6 +151,64 @@ public sealed class PdfPage : IDisposable
         return image;
     }
 
+    /// <summary>
+    /// Renders the page in colour at <paramref name="scale"/> pixels per point, as pypdfium2's
+    /// <c>page.render(scale=scale).to_pil().convert("RGB")</c> does: a white-filled BGR bitmap of
+    /// <c>ceil(size · scale)</c> pixels with annotations drawn, returned as packed RGB.
+    /// </summary>
+    public (byte[] Rgb, int Width, int Height) RenderRgb(double scale)
+    {
+        int w = (int)Math.Ceiling(Width * scale), h = (int)Math.Ceiling(Height * scale);
+        var rgb = new byte[w * h * 3];
+        lock (Pdfium.Lock)
+        {
+            IntPtr bitmap = Pdfium.FPDFBitmap_CreateEx(w, h, Pdfium.FPDFBitmap_BGR, IntPtr.Zero, 0);
+            if (bitmap == IntPtr.Zero)
+            {
+                throw new PdfException($"cannot allocate a {w}x{h} bitmap");
+            }
+
+            try
+            {
+                Pdfium.FPDFBitmap_FillRect(bitmap, 0, 0, w, h, 0xFFFFFFFF);
+                Pdfium.FPDF_RenderPageBitmap(bitmap, Handle, 0, 0, w, h, 0, Pdfium.FPDF_ANNOT);
+                IntPtr buffer = Pdfium.FPDFBitmap_GetBuffer(bitmap);
+                int stride = Pdfium.FPDFBitmap_GetStride(bitmap);
+                var row = new byte[w * 3];
+                for (int y = 0; y < h; y++)
+                {
+                    Marshal.Copy(buffer + (y * stride), row, 0, w * 3);
+                    int o = y * w * 3;
+                    for (int x = 0; x < w * 3; x += 3)
+                    {
+                        rgb[o + x] = row[x + 2];
+                        rgb[o + x + 1] = row[x + 1];
+                        rgb[o + x + 2] = row[x];
+                    }
+                }
+            }
+            finally
+            {
+                Pdfium.FPDFBitmap_Destroy(bitmap);
+            }
+        }
+
+        return (rgb, w, h);
+    }
+
+    /// <summary>
+    /// <c>FPDFPage_Flatten(page, FLAT_NORMALDISPLAY)</c>: bakes annotations and form fields into
+    /// the page content. PDFium requires the page to be reloaded afterwards.
+    /// </summary>
+    /// <returns>False when PDFium reports a failure.</returns>
+    public bool Flatten()
+    {
+        lock (Pdfium.Lock)
+        {
+            return Pdfium.FPDFPage_Flatten(Handle, Pdfium.FLAT_NORMALDISPLAY) != Pdfium.FLATTEN_FAIL;
+        }
+    }
+
     /// <inheritdoc />
     public void Dispose()
     {
