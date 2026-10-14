@@ -267,7 +267,16 @@ public static unsafe class Gemm
             int js = jb + (s * nr);
             int width = Math.Min(nr, je - js);
             float* dst = packed + ((long)s * kc * nr);
-            if (width == nr)
+            if (width == nr && nr == 32 && Wide)
+            {
+                for (int p = 0; p < kc; p++)
+                {
+                    float* row = b + (p * (long)ldb) + js;
+                    Vector512.Load(row).Store(dst + (p * 32));
+                    Vector512.Load(row + 16).Store(dst + (p * 32) + 16);
+                }
+            }
+            else if (width == nr)
             {
                 for (int p = 0; p < kc; p++)
                 {
