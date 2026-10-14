@@ -6,6 +6,26 @@ internal static partial class Operators
 {
     internal enum ReduceOp { Sum, Mean, Max }
 
+    /// <summary>ONNX GlobalAveragePool: the mean of each <c>[n, c]</c> plane, as <c>[N, C, 1, …]</c>.</summary>
+    internal static Tensor GlobalAveragePool(Tensor t)
+    {
+        int planes = t.Shape[0] * t.Shape[1];
+        int size = planes == 0 ? 0 : t.Length / planes;
+        int[] shape = new int[t.Rank];
+        Array.Fill(shape, 1);
+        shape[0] = t.Shape[0];
+        shape[1] = t.Shape[1];
+        Tensor result = Tensor.Float(shape);
+        ReadOnlySpan<float> x = t.Floats;
+        Span<float> z = result.Floats;
+        for (int p = 0; p < planes; p++)
+        {
+            z[p] = TensorPrimitives.Sum(x.Slice(p * size, size)) / size;
+        }
+
+        return result;
+    }
+
     internal static Tensor Reduce(OnnxNode node, List<Tensor?> x, ReduceOp op)
     {
         Tensor t = x[0]!;

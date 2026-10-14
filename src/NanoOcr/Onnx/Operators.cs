@@ -37,6 +37,7 @@ internal static partial class Operators
         ["Softplus"] = (n, x) => [Unary(x[0]!, UnaryOp.Softplus)],
         ["Tanh"] = (n, x) => [Unary(x[0]!, UnaryOp.Tanh)],
         ["Clip"] = (n, x) => [Clip(n, x)],
+        ["HardSigmoid"] = (n, x) => [HardSigmoid(x[0]!, n.Float("alpha", 0.2f), n.Float("beta", 0.5f))],
         ["Cast"] = (n, x) => [Cast(x[0]!, (int)n.Int("to", 1))],
         ["Identity"] = (n, x) => [x[0]!.Reshape(x[0]!.Shape)],
 
@@ -63,6 +64,7 @@ internal static partial class Operators
         ["ReduceMax"] = (n, x) => [Reduce(n, x, ReduceOp.Max)],
         ["ArgMax"] = (n, x) => [ArgMax(x[0]!, (int)n.Int("axis", 0), n.Int("keepdims", 1) != 0, n.Int("select_last_index", 0) != 0)],
         ["Softmax"] = (n, x) => [Softmax(x[0]!, (int)n.Int("axis", -1))],
+        ["GlobalAveragePool"] = (n, x) => [GlobalAveragePool(x[0]!)],
 
         // Neural-network layers (Layers.cs)
         ["Conv"] = (n, x) => [Conv(n, x)],

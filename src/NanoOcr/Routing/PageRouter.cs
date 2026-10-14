@@ -49,9 +49,10 @@ public sealed record RoutedResult<TOutput>(RoutedPage Page, int Route, TOutput O
 /// conversion of their results:
 /// </para>
 /// <code>
-/// using var nano = new NanoOCR(new NanoOcrOptions { KeepImages = true });
+/// using var nano = new NanoOCR(new NanoOcrOptions { ClassifyPages = true, KeepImages = true });
 /// var router = new PageRouter&lt;string&gt;(nano)
 ///     .When(PageCategory.PrintedText, page => page.Ocr.Markdown)
+///     .When(PageCategory.Photo, page => florence.Read(Load(page)))
 ///     .When(PageCategory.TableOrComplex, page => paddle.Parse(Load(page)).ToMarkdown())
 ///     .When(PageCategory.Handwritten, page => paddle.Parse(Load(page)).ToMarkdown())
 ///     .Otherwise(page => paddle.Parse(Load(page)).ToMarkdown());
@@ -75,7 +76,11 @@ public sealed class PageRouter<TOutput>
     private Func<RoutedPage, CancellationToken, ValueTask<TOutput>>? _fallback;
 
     /// <summary>A router classifying with <see cref="PageClassifier"/> and the given thresholds.</summary>
-    /// <param name="ocr">Reads each page (its options decide the markdown, the threads, whether images are kept).</param>
+    /// <param name="ocr">
+    /// Reads each page (its options decide the markdown, the threads, whether images are kept). With
+    /// <see cref="NanoOcrOptions.ClassifyPages"/> on, pages are classified by the page-type model —
+    /// which recognises photos and handwriting the reading alone misses — rather than by the reading rules.
+    /// </param>
     /// <param name="options">Classifier thresholds; the calibrated defaults when omitted.</param>
     public PageRouter(NanoOCR ocr, PageClassifierOptions? options = null)
         : this(ocr, r => PageClassifier.Classify(r, options))

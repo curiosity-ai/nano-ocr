@@ -41,6 +41,13 @@ public sealed class NanoOcrOptions
     /// <summary>Build tables from the order model's table heads instead of from geometry.</summary>
     public bool TableHeads { get; set; }
 
+    /// <summary>
+    /// Classify each page with the page-type model (<see cref="Pipeline.PageTypeModel"/>), for
+    /// <see cref="Routing.PageRouter{TOutput}"/>: <see cref="Pipeline.Page.Type"/>. Off by default — a
+    /// few tens of milliseconds a page that plain OCR does not need.
+    /// </summary>
+    public bool ClassifyPages { get; set; }
+
     /// <summary>Keep each page image on its result (needed by <see cref="OcrResult.SaveToImg"/>).</summary>
     public bool KeepImages { get; set; }
 
@@ -92,6 +99,7 @@ public sealed class NanoOCR : IDisposable
             TableHeads = Options.TableHeads,
             Fusion = Options.Fusion,
             Markdown = Options.Markdown,
+            ClassifyPages = Options.ClassifyPages,
         });
         _converter = new DocumentConverter(Engine, Options.Dpi, Options.Mode, Options.PdfOrder, Options.ImageOcr);
     }

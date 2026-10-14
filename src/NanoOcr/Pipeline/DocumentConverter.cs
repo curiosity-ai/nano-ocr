@@ -240,6 +240,7 @@ public sealed class DocumentConverter
         long t0 = Stopwatch.GetTimestamp();
         GrayImage gray = page.Render(k);
         t["render_ms"] = NanoOcrEngine.Ms(t0);
+        PageTypePrediction? type = Engine.ClassifyPage(gray, t);
         t0 = Stopwatch.GetTimestamp();
         List<LineBox> boxes = Engine.Detect(gray);
         t["det_ms"] = NanoOcrEngine.Ms(t0);
@@ -286,6 +287,7 @@ public sealed class DocumentConverter
         var keep = Enumerable.Range(0, rec.Length).Where(i => rec[i] is not null).ToList();
         Page result = Engine.Assemble(gray.Width, gray.Height, keep.Select(i => boxes[i]).ToList(), keep.Select(i => rec[i]!).ToList(), t, contentOrder: PdfOrder);
         result.Source = source;
+        result.Type = type;
         if (lost > 0)
         {
             result.Note += $"; {lost} chars outside detected lines";

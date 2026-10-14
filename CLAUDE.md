@@ -36,9 +36,10 @@ images; PDFium (native, via P/Invoke — the engine pypdfium2 wraps) renders PDF
 | `src/NanoOcr/Pipeline/NanoOcrEngine.cs` | `pipeline.py` (`OrtOCR`, deskew, orientation) |
 | `src/NanoOcr/Pipeline/Py.cs` | Python/numpy semantics (see below) |
 | `src/NanoOcr/NanoOCR.cs`, `OcrResult.cs` | `__init__.load`, `parallel.convert_many`; the PaddleOCR-style API |
-| `src/NanoOcr/Routing/` | not Indra: `PageClassifier` (category from a page's reading; calibrated on RVL-CDIP, figures in its doc comment) and `PageRouter<TOutput>` (category → recognizer, generic on the output) |
+| `src/NanoOcr/Routing/` | not Indra: `PageClassifier` (category from the page-type model's verdict checked against the page's reading, or from the reading alone; figures in its doc comment and `tools/pagetype/README.md`) and `PageRouter<TOutput>` (category → recognizer, generic on the output) |
+| `src/NanoOcr/Pipeline/PageType.cs` | not Indra: `PageTypeModel`, NanoOCR's own MobileNetV3-Small page-type classifier (printed / table / handwritten / photo), run on the upright page when `ClassifyPages` is on; trained by `tools/pagetype/` |
 | `src/NanoOcr.Cli/` | `cli.py` (`indra-ocr`; here `nano-ocr`), plus `classify`, `bench` and `bench-gemm` |
-| `src/NanoOcr/Models/Assets/` | the `v3.1` models of `datalab-to/indra-ocr`, embedded as resources (hashes in its README) |
+| `src/NanoOcr/Models/Assets/` | the `v3.1` models of `datalab-to/indra-ocr`, embedded as resources (hashes in its README), plus NanoOCR's own `pagetype.onnx` |
 
 Not ported: `viewer.py` (a local web viewer), `bench/opb_indra.py` (OmniParseBench harness), the
 CenterMask path of `line_mask.py` (the v3.1 model set ships no `mask.onnx`), and the training-only
@@ -87,6 +88,17 @@ helpers (`encode_targets`, vocabulary builders, label canonicalization).
   the same `PageElement`s, so a change to how blocks are built shows in the parity tests, and a
   change to the PaddleOCR style shows in `MarkdownTests`. The document-level passes (title, title
   levels, table merging) run in `MarkdownDocument.Finish`, which `NanoOCR` applies per file.
+
+## The page-type model
+
+`pagetype.onnx` is the one model that is NanoOCR's rather than Indra's, so `.reference/` says
+nothing about it: `tools/pagetype/` is its specification. Its input is
+`tools/pagetype/pagetype_input.py`, and `PageTypeModel.Input` must produce the same floats — the
+resize is OpenCV's INTER_AREA, which `CvResize` reproduces to the byte. Every training source is
+permissively licensed because the weights ship in the package; RVL-CDIP and IAM are for scoring
+only. After retraining, copy the export over, regenerate the layer fixtures (`dump_layers.py`
+dumps it like the Indra models) and update the figures in `tools/pagetype/README.md` and the
+README's routing section. `ClassifyPages` is off by default so plain OCR pays nothing for it.
 
 ## Validation
 

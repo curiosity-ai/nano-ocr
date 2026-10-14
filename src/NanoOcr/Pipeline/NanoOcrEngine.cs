@@ -32,6 +32,13 @@ public sealed class EngineOptions
     public bool Fusion { get; set; } = true;
 
     /// <summary>
+    /// Classify each page with <see cref="PageTypeModel"/> and keep the verdict on
+    /// <see cref="Page.Type"/>, for <see cref="Routing.PageClassifier"/> to route on. Off by default:
+    /// it adds a few tens of milliseconds to every page and changes nothing about its reading.
+    /// </summary>
+    public bool ClassifyPages { get; set; }
+
+    /// <summary>
     /// How <see cref="Page.Markdown"/> is written: PaddleOCR-style by default,
     /// <see cref="MarkdownOptions.Reference"/> for the Python original's. The document-level
     /// passes in it are applied by <see cref="MarkdownDocument.Finish"/>, not per page.
@@ -88,6 +95,7 @@ public sealed class NanoOcrEngine
     private readonly InferenceSession? _orient;
     private readonly InferenceSession? _script;
     private readonly InferenceSession? _recCjk;
+    private readonly PageTypeModel? _pageType;
     private readonly int _spaceId;
 
     /// <summary>Loads the models.</summary>
@@ -111,6 +119,11 @@ public sealed class NanoOcrEngine
         if (Options.Math)
         {
             MathReader = MathReader.Load(store, Options.Fusion) ?? throw new ModelException("Math=true needs the math models.");
+        }
+
+        if (Options.ClassifyPages)
+        {
+            _pageType = PageTypeModel.Load(store, Options.Fusion) ?? throw new ModelException("ClassifyPages=true needs the page-type model.");
         }
 
         LongSide = meta.RootElement.GetProperty("det_long_side").GetInt32();
@@ -738,6 +751,7 @@ public sealed class NanoOcrEngine
         long t0 = Stopwatch.GetTimestamp();
         (gray, int k, double skew) = Upright(gray, turn);
         t["orient_ms"] = Ms(t0);
+        PageTypePrediction? type = ClassifyPage(gray, t);
         t0 = Stopwatch.GetTimestamp();
         List<LineBox> boxes = Detect(gray);
         t["det_ms"] = Ms(t0);
@@ -747,6 +761,7 @@ public sealed class NanoOcrEngine
         Page page = Assemble(gray.Width, gray.Height, boxes, rec, t);
         page.Rotation = 90 * k;
         page.Skew = Py.Round(skew, 2);
+        page.Type = type;
         if (skew != 0)
         {
             foreach (Line ln in page.Lines)
@@ -761,6 +776,27 @@ public sealed class NanoOcrEngine
         }
 
         return page;
+    }
+
+    /// <summary>
+    /// The page-type model's verdict on an upright page when <see cref="EngineOptions.ClassifyPages"/>
+    /// is on, timed as <c>type_ms</c>; <see langword="null"/> otherwise.
+    /// </summary>
+    public PageTypePrediction? ClassifyPage(GrayImage upright, Dictionary<string, double>? timings = null)
+    {
+        if (_pageType is null)
+        {
+            return null;
+        }
+
+        long t0 = Stopwatch.GetTimestamp();
+        PageTypePrediction p = _pageType.Predict(upright);
+        if (timings is not null)
+        {
+            timings["type_ms"] = Ms(t0);
+        }
+
+        return p;
     }
 
     /// <summary>Runs a model the way <see cref="EngineOptions.Fusion"/> says.</summary>
