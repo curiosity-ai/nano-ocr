@@ -85,7 +85,7 @@ internal static partial class Operators
         // A residual of another shape (a broadcast) is added after the convolution instead.
         bool fuseResidual = residual is not null && residual.Type == ElementType.Float && residual.Shape.AsSpan().SequenceEqual(output.Shape);
         var epilogue = new Epilogue(fuseResidual ? residual!.FloatArray : null, ParseActivation(residual is null || fuseResidual ? act : ""));
-        if (group == c && cg == 1 && m % c == 0)
+        if (group == c && cg == 1 && m % c == 0 && (m == c || kh * kw <= 25))
         {
             Depthwise(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p, epilogue);
         }
@@ -227,6 +227,12 @@ internal static partial class Operators
             return;
         }
 
+        if (Gemm.Wide && !pointwise && p.Group == 1 && n > 1 && (long)n * k * pixels <= 1 << 19)
+        {
+            Im2ColBatched(input, weight, bias, output, n, p, epilogue);
+            return;
+        }
+
         int workers = Parallelism.Workers;
         if (workers <= 1 || jobs == 1 || work < 1 << 20)
         {
@@ -340,6 +346,53 @@ internal static partial class Operators
         {
             System.Buffers.ArrayPool<float>.Shared.Return(packed);
             System.Buffers.ArrayPool<float>.Shared.Return(product);
+        }
+    }
+
+    /// <summary>
+    /// A convolution over a batch of small images (the recognizer's 32×4 stem, one output row per
+    /// line): every item's im2col columns <c>[k, pixels]</c> go into one buffer, and one segmented
+    /// product covers the whole batch (<see cref="Gemm.MultiplyBatched"/>) instead of one narrow
+    /// product per item with a partial strip at its end. Bias first, then the FMA chain, as the
+    /// per-item path computes it.
+    /// </summary>
+    private static void Im2ColBatched(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
+    {
+        int k = p.Cg * p.Kh * p.Kw;
+        int pixels = p.Oh * p.Ow;
+        float[] col = System.Buffers.ArrayPool<float>.Shared.Rent(n * k * pixels);
+        try
+        {
+            Parallelism.For(n, (long)n * k * pixels, (b0, b1) =>
+            {
+                float[] scratch = System.Buffers.ArrayPool<float>.Shared.Rent(k * pixels);
+                for (int b = b0; b < b1; b++)
+                {
+                    Im2Col(input.AsSpan(b * p.C * p.H * p.W), p, 0, pixels, scratch);
+                    scratch.AsSpan(0, k * pixels).CopyTo(col.AsSpan(b * k * pixels));
+                    for (int r = 0; r < p.M; r++)
+                    {
+                        output.AsSpan(((b * p.M) + r) * pixels, pixels).Fill(bias is null ? 0f : bias[r]);
+                    }
+                }
+
+                System.Buffers.ArrayPool<float>.Shared.Return(scratch);
+            });
+            Gemm.MultiplyBatched(p.M, pixels, n, k, weight, k, col, (long)k * pixels, output, (long)p.M * pixels, accumulate: true);
+            if (!epilogue.IsEmpty)
+            {
+                Parallelism.For(n * p.M, (long)n * p.M * pixels, (r0, r1) =>
+                {
+                    for (int r = r0; r < r1; r++)
+                    {
+                        epilogue.Apply(output.AsSpan(r * pixels, pixels), r * pixels);
+                    }
+                });
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(col);
         }
     }
 
@@ -592,8 +645,11 @@ internal static partial class Operators
             a3.Store(o + ox + 48);
         }
 
-        for (; ox + 16 <= ow; ox += 16)
+        for (; ox < ow && ow >= 16; ox += 16)
         {
+            // The last vector may overlap the previous one: each column is computed from scratch,
+            // so the overlap rewrites the same values.
+            ox = Math.Min(ox, ow - 16);
             Vector512<float> a0 = b;
             float* r = row + ox;
             for (int t = 0; t < nt; t++)
@@ -633,8 +689,10 @@ internal static partial class Operators
             a3.Store(o + ox + 24);
         }
 
-        for (; ox + 8 <= ow; ox += 8)
+        for (; ox < ow && ow >= 8; ox += 8)
         {
+            // The last vector may overlap the previous one (each column is computed from scratch).
+            ox = Math.Min(ox, ow - 8);
             Vector256<float> a0 = b;
             float* r = row + ox;
             for (int t = 0; t < nt; t++)

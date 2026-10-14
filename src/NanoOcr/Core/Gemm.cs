@@ -78,7 +78,7 @@ public static unsafe class Gemm
     /// Each output is the same in-order FMA chain as <see cref="Multiply"/> computes. Requires the
     /// 512-bit kernels (<see cref="Wide"/>).
     /// </summary>
-    public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride)
+    public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride, bool accumulate = false)
     {
         if (!Wide)
         {
@@ -94,7 +94,7 @@ public static unsafe class Gemm
         fixed (float* pb = b)
         fixed (float* pc = c)
         {
-            Run(pa, lda, pb, t, pc, t, m, t * batch, k, false, new Segments(t, bStride, cStride));
+            Run(pa, lda, pb, t, pc, t, m, t * batch, k, accumulate, new Segments(t, bStride, cStride));
         }
     }
 
