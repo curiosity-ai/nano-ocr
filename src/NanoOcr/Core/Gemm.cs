@@ -592,20 +592,36 @@ public static unsafe class Gemm
     {
         const int nr = 32;
         float* t = stackalloc float[8 * nr];
-        long* col = stackalloc long[nr];
-        for (int q = 0; q < width; q++)
+
+        // The strip's columns as runs that are contiguous in C (one, or two across an item boundary).
+        int* runStart = stackalloc int[nr + 1];
+        long* runCol = stackalloc long[nr];
+        int runs = 0;
+        for (int q = 0; q < width;)
         {
-            col[q] = seg.IsNone ? js + q : seg.C(js + q);
+            int j = js + q;
+            int len = seg.IsNone ? width - q : Math.Min(width - q, seg.Len - (j % seg.Len));
+            runStart[runs] = q;
+            runCol[runs++] = seg.IsNone ? j : seg.C(j);
+            q += len;
         }
+
+        runStart[runs] = width;
 
         for (int r0 = 0; r0 < rows; r0 += 8)
         {
             int rr = Math.Min(8, rows - r0);
             for (int r = 0; r < rr; r++)
             {
-                for (int q = 0; q < nr; q++)
+                float* tr = t + (r * nr);
+                new Span<float>(tr, nr).Clear();
+                if (add)
                 {
-                    t[(r * nr) + q] = add && q < width ? c[((r0 + r) * (long)ldc) + col[q]] : 0f;
+                    for (int u = 0; u < runs; u++)
+                    {
+                        int len = runStart[u + 1] - runStart[u];
+                        Buffer.MemoryCopy(c + ((r0 + r) * (long)ldc) + runCol[u], tr + runStart[u], len * sizeof(float), len * sizeof(float));
+                    }
                 }
             }
 
@@ -636,9 +652,10 @@ public static unsafe class Gemm
 
             for (int r = 0; r < rr; r++)
             {
-                for (int q = 0; q < width; q++)
+                for (int u = 0; u < runs; u++)
                 {
-                    c[((r0 + r) * (long)ldc) + col[q]] = t[(r * nr) + q];
+                    int len = runStart[u + 1] - runStart[u];
+                    Buffer.MemoryCopy(t + (r * nr) + runStart[u], c + ((r0 + r) * (long)ldc) + runCol[u], len * sizeof(float), len * sizeof(float));
                 }
             }
         }
@@ -669,7 +686,26 @@ public static unsafe class Gemm
                 int j = js + q0;
                 int run = Math.Min(width - q0, seg.Len - (j % seg.Len));
                 float* src = b + seg.B(j);
-                if (seg.Scale == 0)
+                if (run == 32 && nr == 32)
+                {
+                    // The common case, a whole strip inside one item: two vectors a row.
+                    float* scale = seg.Scale == 0 ? null : (float*)seg.Scale + ((long)(j / seg.Len) * seg.ScaleStride) + kb;
+                    for (int p = 0; p < kc; p++)
+                    {
+                        float* row = src + (p * (long)ldb);
+                        Vector512<float> v0 = Vector512.Load(row), v1 = Vector512.Load(row + 16);
+                        if (scale != null)
+                        {
+                            var sv = Vector512.Create(scale[p]);
+                            v0 *= sv;
+                            v1 *= sv;
+                        }
+
+                        v0.Store(dst + (p * 32));
+                        v1.Store(dst + (p * 32) + 16);
+                    }
+                }
+                else if (seg.Scale == 0)
                 {
                     for (int p = 0; p < kc; p++)
                     {
