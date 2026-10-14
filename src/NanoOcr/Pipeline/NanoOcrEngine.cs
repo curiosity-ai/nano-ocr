@@ -384,7 +384,7 @@ public sealed class NanoOcrEngine
     /// </summary>
     public LineReading[] Recognize(GrayImage gray, IReadOnlyList<LineBox> boxes, int batch = 64)
     {
-        var crops = boxes.Select(b => LineCrops.Crop(gray, b, Height)).ToList();
+        List<LineCrop> crops = CropLines(gray, boxes);
         var result = new LineReading[crops.Count];
         Array.Fill(result, LineReading.Empty);
         var groups = new List<(InferenceSession Session, Vocab Vocab, List<int> Lines, bool AsChars)>
@@ -401,60 +401,20 @@ public sealed class NanoOcrEngine
             ];
         }
 
+        // Every width batch of both recognizers is independent: they run at once, each with a
+        // share of the threads proportional to its size (Parallelism.Jobs).
+        var jobs = new List<(InferenceSession Session, Vocab Vocab, List<int> Lines, bool AsChars)>();
         foreach (var (session, vocab, sel, asChars) in groups)
         {
             foreach (List<int> part in LineCrops.WidthBatches(sel.Select(j => crops[j].Width).ToList(), batch))
             {
-                List<int> idx = part.Select(i => sel[i]).ToList();
-                (Tensor x, Tensor widths) = LineCrops.PadBatch(idx.Select(j => crops[j]).ToList());
-                int padded = x.Shape[3];
-                Tensor[] outs = Run(session, new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
-                x.Release();
-                widths.Release();
-                Tensor best = outs[0], pmax = outs[1], lengths = outs[2];
-                int steps = best.Shape[1];
-                double stride = (double)padded / Math.Max(steps, 1);
-                for (int k = 0; k < idx.Count; k++)
-                {
-                    int j = idx[k];
-                    int n = (int)lengths.Longs[k];
-                    ReadOnlySpan<long> seq = best.Longs.Slice(k * steps, n);
-                    ReadOnlySpan<float> pm = pmax.Floats.Slice(k * steps, n);
-                    var keptIds = new List<int>();
-                    var keptP = new List<float>();
-                    var toks = new List<Token>();
-                    LineBox box = boxes[j];
-                    double x0 = box.X0, y0 = box.Y0, x1 = box.X1, y1 = box.Y1;
-                    double h = Math.Max(1.0, y1 - y0);
-                    double ix0 = Math.Floor(x0 - (LineCrops.PadX * h));
-                    double cw = Math.Ceiling(x1 + (LineCrops.PadX * h)) - ix0;
-                    double f = cw / crops[j].Width;
-                    for (int t = 0; t < n; t++)
-                    {
-                        if (seq[t] == 0 || (t > 0 && seq[t] == seq[t - 1]))
-                        {
-                            continue;
-                        }
-
-                        int id = (int)seq[t];
-                        double xs = ix0 + ((t + 0.5) * stride * f);
-                        keptIds.Add(id);
-                        keptP.Add(pm[t]);
-                        toks.Add(asChars ? new Token(-1, vocab.Tokens[id - 1], xs) : new Token(id, null, xs));
-                    }
-
-                    double conf = keptP.Count > 0 ? Py.Mean(keptP.ToArray()) : 0.0;
-                    result[j] = conf >= MinConf
-                        ? new LineReading(vocab.Decode(keptIds), conf, toks)
-                        : new LineReading("", conf, []);
-                }
-
-                foreach (Tensor t in outs)
-                {
-                    t.Release();
-                }
+                jobs.Add((session, vocab, part.Select(i => sel[i]).ToList(), asChars));
             }
         }
+
+        Core.Parallelism.Jobs(
+            jobs.Select(j => (double)j.Lines.Count * j.Lines.Max(l => crops[l].Width)).ToArray(),
+            b => RecognizeBatch(jobs[b].Session, jobs[b].Vocab, jobs[b].Lines, jobs[b].AsChars, crops, boxes, result));
 
         if (MathReader is not null && crops.Count > 0)
         {
@@ -479,6 +439,72 @@ public sealed class NanoOcrEngine
         return result;
     }
 
+    /// <summary>Line crops of every box (<c>crop_line</c>), in parallel.</summary>
+    private List<LineCrop> CropLines(GrayImage gray, IReadOnlyList<LineBox> boxes)
+    {
+        var crops = new LineCrop[boxes.Count];
+        Core.Parallelism.For(boxes.Count, (long)boxes.Count * 65536, (s, e) =>
+        {
+            for (int i = s; i < e; i++)
+            {
+                crops[i] = LineCrops.Crop(gray, boxes[i], Height);
+            }
+        });
+        return [.. crops];
+    }
+
+    /// <summary>One width batch through a recognizer, decoded into <paramref name="result"/> (its own lines only).</summary>
+    private void RecognizeBatch(InferenceSession session, Vocab vocab, List<int> idx, bool asChars, List<LineCrop> crops, IReadOnlyList<LineBox> boxes, LineReading[] result)
+    {
+        (Tensor x, Tensor widths) = LineCrops.PadBatch(idx.Select(j => crops[j]).ToList());
+        int padded = x.Shape[3];
+        Tensor[] outs = Run(session, new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
+        x.Release();
+        widths.Release();
+        Tensor best = outs[0], pmax = outs[1], lengths = outs[2];
+        int steps = best.Shape[1];
+        double stride = (double)padded / Math.Max(steps, 1);
+        for (int k = 0; k < idx.Count; k++)
+        {
+            int j = idx[k];
+            int n = (int)lengths.Longs[k];
+            ReadOnlySpan<long> seq = best.Longs.Slice(k * steps, n);
+            ReadOnlySpan<float> pm = pmax.Floats.Slice(k * steps, n);
+            var keptIds = new List<int>();
+            var keptP = new List<float>();
+            var toks = new List<Token>();
+            LineBox box = boxes[j];
+            double x0 = box.X0, y0 = box.Y0, x1 = box.X1, y1 = box.Y1;
+            double h = Math.Max(1.0, y1 - y0);
+            double ix0 = Math.Floor(x0 - (LineCrops.PadX * h));
+            double cw = Math.Ceiling(x1 + (LineCrops.PadX * h)) - ix0;
+            double f = cw / crops[j].Width;
+            for (int t = 0; t < n; t++)
+            {
+                if (seq[t] == 0 || (t > 0 && seq[t] == seq[t - 1]))
+                {
+                    continue;
+                }
+
+                int id = (int)seq[t];
+                double xs = ix0 + ((t + 0.5) * stride * f);
+                keptIds.Add(id);
+                keptP.Add(pm[t]);
+                toks.Add(asChars ? new Token(-1, vocab.Tokens[id - 1], xs) : new Token(id, null, xs));
+            }
+
+            double conf = keptP.Count > 0 ? Py.Mean(keptP.ToArray()) : 0.0;
+            result[j] = conf >= MinConf
+                ? new LineReading(vocab.Decode(keptIds), conf, toks)
+                : new LineReading("", conf, []);
+        }
+
+        foreach (Tensor t in outs)
+        {
+            t.Release();
+        }
+    }
+
     /// <summary><c>hanzi_lines</c>: per line crop, does it hold Chinese characters?</summary>
     public bool[] HanziLines(IReadOnlyList<LineCrop> crops, int batch = 64)
     {
@@ -488,8 +514,10 @@ public sealed class NanoOcrEngine
             return result;
         }
 
-        foreach (List<int> idx in LineCrops.WidthBatches(crops.Select(c => c.Width).ToList(), batch))
+        List<List<int>> batches = LineCrops.WidthBatches(crops.Select(c => c.Width).ToList(), batch);
+        Core.Parallelism.Jobs(batches.Select(b => (double)b.Count * b.Max(j => crops[j].Width)).ToArray(), bi =>
         {
+            List<int> idx = batches[bi];
             (Tensor x, Tensor widths) = LineCrops.PadBatch(idx.Select(j => crops[j]).ToList());
             Tensor[] outs = Run(_script, new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
             for (int k = 0; k < idx.Count; k++)
@@ -500,7 +528,7 @@ public sealed class NanoOcrEngine
             outs[0].Release();
             x.Release();
             widths.Release();
-        }
+        });
 
         return result;
     }

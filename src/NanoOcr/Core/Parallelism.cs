@@ -66,6 +66,50 @@ public static class Parallelism
         ForChunks(count, chunks, body);
     }
 
+    /// <summary>
+    /// Runs independent jobs of different sizes at once — the recognizer's width batches, say:
+    /// up to <see cref="Workers"/> at a time, largest first, each with a share of the workers
+    /// proportional to its cost (at least one) as the degree of the kernels inside it. One dominant
+    /// job therefore still gets every worker, and many similar ones get one each: parallelism
+    /// across jobs where a job is too small to split well, within a job where it is not.
+    /// </summary>
+    /// <param name="costs">A relative cost per job (e.g. lines × width).</param>
+    /// <param name="body">Runs job <c>i</c>; jobs must not depend on each other.</param>
+    public static void Jobs(IReadOnlyList<double> costs, Action<int> body)
+    {
+        int n = costs.Count;
+        int workers = Workers;
+        if (workers <= 1 || n <= 1)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                body(i);
+            }
+
+            return;
+        }
+
+        double total = Math.Max(costs.Sum(), double.Epsilon);
+        int[] order = Enumerable.Range(0, n).OrderByDescending(i => costs[i]).ToArray();
+        ParallelOptions current = Options;
+        var outer = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = workers,
+            CancellationToken = current.CancellationToken,
+            TaskScheduler = current.TaskScheduler ?? TaskScheduler.Default,
+        };
+
+        // No buffering: workers take jobs one at a time, in the order given (largest first).
+        Parallel.ForEach(System.Collections.Concurrent.Partitioner.Create(order, System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering), outer, i =>
+        {
+            int share = (int)Math.Clamp(Math.Round(workers * costs[i] / total), 1, workers);
+            using (Use(new ParallelOptions { MaxDegreeOfParallelism = share, CancellationToken = current.CancellationToken }))
+            {
+                body(i);
+            }
+        });
+    }
+
     private static void ForChunks(int count, int chunks, Action<int, int> body)
     {
         int size = (count + chunks - 1) / chunks;

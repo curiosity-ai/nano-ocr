@@ -85,7 +85,7 @@ public sealed class InferenceSession
     /// <summary>The nodes a run without an observer executes: <see cref="Nodes"/> after fusion.</summary>
     public IReadOnlyList<OnnxNode> FusedNodes => _fusedNodes;
 
-    /// <summary>Accumulates time per operator type when set.</summary>
+    /// <summary>Accumulates time per operator type when set (thread-safe; concurrent runs add up).</summary>
     public Dictionary<string, double>? Profile { get; set; }
 
     /// <summary>
@@ -169,8 +169,16 @@ public sealed class InferenceSession
                 string key = node.OpType is "MatMul" or "Transpose" or "Gather" ? $"{node.OpType} {string.Join("x", args[0]!.Shape)}*{string.Join("x", args.Count > 1 && args[1] is not null ? args[1]!.Shape : [])}" : node.OpType is "Mul" ? $"Mul {string.Join("x", args[0]!.Shape)}*{string.Join("x", args[1]!.Shape)}" : node.OpType == "Conv"
                     ? $"Conv {string.Join("x", node.Ints("kernel_shape") ?? [])} g{node.Int("group", 1)} {string.Join("x", args[0]!.Shape)}"
                     : node.OpType;
-                Profile[key] = Profile.GetValueOrDefault(key) + ms;
-                Profile["#" + key] = Profile.GetValueOrDefault("#" + key) + 1;
+                Dictionary<string, double>? profile = Profile;
+                if (profile is not null)
+                {
+                    // Runs of one session may be concurrent (the recognizer's batches are).
+                    lock (profile)
+                    {
+                        profile[key] = profile.GetValueOrDefault(key) + ms;
+                        profile["#" + key] = profile.GetValueOrDefault("#" + key) + 1;
+                    }
+                }
             }
 
             int[] outs = plan.NodeOutputs[i];
