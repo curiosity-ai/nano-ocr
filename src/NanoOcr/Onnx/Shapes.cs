@@ -1,3 +1,5 @@
+using System.Runtime.Intrinsics;
+
 namespace NanoOcr.Onnx;
 
 internal static partial class Operators
@@ -391,9 +393,21 @@ internal static partial class Operators
                 case ElementType.Float:
                     {
                         float[] s = x.FloatArray, d = result.FloatArray;
-                        for (int i = 0, p = srcBase; i < innerLen; i++, p += innerStride)
+                        if (innerStride == 1)
                         {
-                            d[dst + i] = s[p];
+                            s.AsSpan(srcBase, innerLen).CopyTo(d.AsSpan(dst, innerLen));
+                        }
+                        else if (innerStride == 2)
+                        {
+                            // A space-to-depth's inner run (every other element): vector deinterleave.
+                            Deinterleave(s.AsSpan(srcBase, (2 * innerLen) - 1), 0, d.AsSpan(dst, innerLen));
+                        }
+                        else
+                        {
+                            for (int i = 0, p = srcBase; i < innerLen; i++, p += innerStride)
+                            {
+                                d[dst + i] = s[p];
+                            }
                         }
 
                         break;
@@ -535,6 +549,27 @@ internal static partial class Operators
         return result;
     }
 
+    /// <summary><c>dst[2i] = a[i]</c>, <c>dst[2i + 1] = b[i]</c>.</summary>
+    private static void Interleave(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> dst)
+    {
+        int i = 0;
+        for (; i + 8 <= a.Length; i += 8)
+        {
+            var va = System.Runtime.Intrinsics.Vector256.Create(a.Slice(i, 8));
+            var vb = System.Runtime.Intrinsics.Vector256.Create(b.Slice(i, 8));
+            var lo = System.Runtime.Intrinsics.X86.Avx.UnpackLow(va, vb);
+            var hi = System.Runtime.Intrinsics.X86.Avx.UnpackHigh(va, vb);
+            System.Runtime.Intrinsics.X86.Avx.Permute2x128(lo, hi, 0x20).CopyTo(dst.Slice(2 * i, 8));
+            System.Runtime.Intrinsics.X86.Avx.Permute2x128(lo, hi, 0x31).CopyTo(dst.Slice((2 * i) + 8, 8));
+        }
+
+        for (; i < a.Length; i++)
+        {
+            dst[2 * i] = a[i];
+            dst[(2 * i) + 1] = b[i];
+        }
+    }
+
     internal static Tensor DepthToSpace(Tensor x, int block, string mode)
     {
         int n = x.Shape[0], c = x.Shape[1], h = x.Shape[2], w = x.Shape[3];
@@ -542,6 +577,31 @@ internal static partial class Operators
         Tensor result = Tensor.Float([n, oc, h * block, w * block]);
         float[] s = x.FloatArray, d = result.FloatArray;
         bool crd = mode == "CRD";
+        if (block == 2 && System.Runtime.Intrinsics.X86.Avx.IsSupported)
+        {
+            // Each output row interleaves two source rows (bx = 0, 1).
+            for (int b = 0; b < n; b++)
+            {
+                for (int ch = 0; ch < oc; ch++)
+                {
+                    for (int by = 0; by < 2; by++)
+                    {
+                        int c0 = crd ? (ch * 4) + (by * 2) : (by * 2 * oc) + ch;
+                        int c1 = crd ? c0 + 1 : c0 + oc;
+                        for (int y = 0; y < h; y++)
+                        {
+                            Interleave(
+                                s.AsSpan((((b * c) + c0) * h * w) + (y * w), w),
+                                s.AsSpan((((b * c) + c1) * h * w) + (y * w), w),
+                                d.AsSpan(((((b * oc) + ch) * h * 2) + (y * 2) + by) * w * 2, w * 2));
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
         for (int b = 0; b < n; b++)
         {
             for (int ch = 0; ch < oc; ch++)
