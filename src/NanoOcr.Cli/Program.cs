@@ -29,6 +29,10 @@ internal static class Cli
           --password PW         password of encrypted PDFs
           --keep-furniture      keep page headers and footers in the markdown
           --math                write math as LaTeX ($...$); slower on pages with math
+          --no-orientation      do not turn pages upright with the orientation model
+          --table-heads         build tables from the order model's table heads, not geometry
+          --no-fusion           run the models' graphs as written (same results, slower)
+          --gemm-256            use the 256-bit kernels where 512-bit ones would run
           --timings             print per-page source and time to stderr
           --model-dir DIR       folder with the models (default: the embedded models)
           --save-img DIR        also save each page with its blocks and lines drawn over it
@@ -76,6 +80,10 @@ internal static class Cli
                     case "--password": password = Next(); break;
                     case "--keep-furniture": options.Furniture = true; break;
                     case "--math": options.Math = true; break;
+                    case "--no-orientation": options.UseDocOrientationClassify = false; break;
+                    case "--table-heads": options.TableHeads = true; break;
+                    case "--no-fusion": options.Fusion = false; break;
+                    case "--gemm-256": NanoOcr.Core.Gemm.Wide = false; break;
                     case "--timings": timings = true; break;
                     case "--model-dir": modelDir = Next(); break;
                     case "--save-img": saveImg = Next(); options.KeepImages = true; break;

@@ -74,7 +74,8 @@ foreach (var (path, pages, error) in ocr.PredictMany(files, cores: 8))
 | `KeepImages` | false | keep page images on the results (for `SaveToImg`) |
 | `Fusion` | true | run the models with element-wise nodes fused into the convolutions; false runs the graphs as written (same results, slower) |
 
-Everything is configured in code; the library reads no environment variables.
+Everything is configured in code (or, for `nano-ocr`, with command-line arguments: `nano-ocr --help`);
+nothing reads environment variables.
 
 Stage-level access is public too: `NanoOcrEngine` (the port of `OrtOCR`: `Detect`, `Recognize`,
 `Upright`, `Assemble`, …), `DocumentConverter`, `NanoOcr.Onnx.InferenceSession` (run any of the
@@ -90,6 +91,8 @@ nano-ocr *.pdf --out results/            # one .md per input
 nano-ocr scan.png --format json          # lines, boxes, layout blocks, confidences, timings
 nano-ocr paper.pdf --mode ocr --timings  # ignore the text layer; timings on stderr
 nano-ocr paper.pdf --math                # write math as LaTeX
+nano-ocr scan.png --no-orientation       # the page is known to be upright
+nano-ocr scan.png --no-fusion --gemm-256 # graphs as written, 256-bit kernels (A/B; same output)
 nano-ocr scan.png --save-img out/        # draw blocks and lines over the page
 nano-ocr bench page.png                  # warm stage timings, per-operator profile
 ```
