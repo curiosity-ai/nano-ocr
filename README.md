@@ -28,7 +28,9 @@ normative specification.
 | [`NanoOCR.Cli`](https://www.nuget.org/packages/NanoOCR.Cli/) | [![NuGet](https://img.shields.io/nuget/v/NanoOCR.Cli.svg?label=)](https://www.nuget.org/packages/NanoOCR.Cli/) | the `nano-ocr` command: `dotnet tool install -g NanoOCR.Cli` |
 
 .NET 10, Windows, Linux and macOS (PDFium and SkiaSharp native assets for all three come with the
-package). Versions are CalVer (`yy.M.build`), published from `main` by
+library package). The tool is published per platform — `win-x64`, `win-arm64`, `linux-x64`,
+`linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `osx-x64`, `osx-arm64` — and `dotnet tool
+install` (.NET 10 SDK) downloads only the one for your machine. Versions are CalVer (`yy.M.build`), published from `main` by
 [`.devops/azure-pipelines.yml`](https://github.com/curiosity-ai/nano-ocr/blob/main/.devops/azure-pipelines.yml).
 
 ## Quick start

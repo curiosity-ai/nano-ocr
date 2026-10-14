@@ -1,11 +1,17 @@
 # Publishes NanoOCR to nuget.org on every push to main, the same way sentence-transformers-sharp
 # publishes its packages: one CalVer version (yy.M.<buildId>) stamped on every package of a run,
-# packages produced by building with GeneratePackageOnBuild, pushed through the
-# 'nuget-curiosity-org' service connection.
+# pushed through the 'nuget-curiosity-org' service connection.
 #
-# Two packages:
-#   NanoOCR      src/NanoOcr       the library, models embedded
-#   NanoOCR.Cli  src/NanoOcr.Cli   the nano-ocr .NET tool (depends on NanoOCR at the same version)
+# Packages:
+#   NanoOCR             src/NanoOcr       the library, models embedded
+#   NanoOCR.Cli         src/NanoOcr.Cli   the nano-ocr .NET tool: a small pointer package ...
+#   NanoOCR.Cli.<rid>                     ... and one package per runtime (RuntimeIdentifiers in the
+#                                         csproj), each with only that platform's PDFium and SkiaSharp.
+#                                         `dotnet tool install` picks the right one (.NET 10 SDK).
+#
+# The tool is packed with `dotnet pack`: a RID-specific tool can't be packed by GeneratePackageOnBuild.
+# The RID packages are pushed before the pointer package, so an install never finds the pointer
+# without the package it points to.
 
 variables:
   projectLibrary:     './src/NanoOcr/NanoOcr.csproj'
@@ -13,6 +19,7 @@ variables:
   solution:           './NanoOcr.slnx'
   buildConfiguration: 'Release'
   targetVersion:      yy.M.$(build.buildId)
+  packageDir:         '$(Build.ArtifactStagingDirectory)/packages'
 
 pool:
   vmImage: 'windows-latest'
@@ -51,23 +58,33 @@ steps:
     projects: '$(solution)'
 
 - task: DotNetCoreCLI@2
-  displayName: 'build NanoOCR'
+  displayName: 'pack NanoOCR'
   inputs:
-    command: 'build'
+    command: 'custom'
+    custom: 'pack'
     projects: '$(projectLibrary)'
-    arguments: '-c $(buildConfiguration) /p:Version=$(targetVersion) /p:GeneratePackageOnBuild=true'
+    arguments: '-c $(buildConfiguration) -o $(packageDir) /p:Version=$(targetVersion)'
 
 - task: DotNetCoreCLI@2
-  displayName: 'build NanoOCR.Cli'
+  displayName: 'pack NanoOCR.Cli (pointer + one package per runtime)'
   inputs:
-    command: 'build'
+    command: 'custom'
+    custom: 'pack'
     projects: '$(projectCli)'
-    arguments: '-c $(buildConfiguration) /p:Version=$(targetVersion) /p:GeneratePackageOnBuild=true'
+    arguments: '-c $(buildConfiguration) -o $(packageDir) /p:Version=$(targetVersion)'
 
 - task: NuGetCommand@2
-  displayName: 'push all nuget packages'
+  displayName: 'push NanoOCR and the NanoOCR.Cli runtime packages'
   inputs:
     command: 'push'
-    packagesToPush: '**/*.nupkg'
+    packagesToPush: '$(packageDir)/*.nupkg;!$(packageDir)/NanoOCR.Cli.$(targetVersion).nupkg'
+    nuGetFeedType: 'external'
+    publishFeedCredentials: 'nuget-curiosity-org'
+
+- task: NuGetCommand@2
+  displayName: 'push the NanoOCR.Cli pointer package'
+  inputs:
+    command: 'push'
+    packagesToPush: '$(packageDir)/NanoOCR.Cli.$(targetVersion).nupkg'
     nuGetFeedType: 'external'
     publishFeedCredentials: 'nuget-curiosity-org'
