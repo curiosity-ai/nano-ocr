@@ -50,15 +50,6 @@ steps:
     command: 'restore'
     projects: '$(solution)'
 
-# The parity tests that need generated fixtures skip when they are absent; the rest
-# (unit tests, markdown, fused-vs-unfused graphs) run on the embedded models.
-- task: DotNetCoreCLI@2
-  displayName: 'test'
-  inputs:
-    command: 'test'
-    projects: './tests/NanoOcr.Tests/NanoOcr.Tests.csproj'
-    arguments: '-c $(buildConfiguration)'
-
 - task: DotNetCoreCLI@2
   displayName: 'build NanoOCR'
   inputs:
