@@ -96,7 +96,7 @@ public class LayerParityTests(ITestOutputHelper output)
         Tensor[] fused = session.Run(feed);
         Tensor[] plain = session.RunUnfused(feed);
         output.WriteLine($"{model}: {session.Nodes.Count} nodes, {session.FusedNodes.Count} after fusion");
-        bool reordered = session.FusedNodes.Any(n => n.OpType == "SoftmaxPeak");
+        bool reordered = session.FusedNodes.Any(n => n.OpType is "SoftmaxPeak" or "ConvSoftmaxPeak");
         for (int o = 0; o < fused.Length; o++)
         {
             Assert.Equal(plain[o].Shape, fused[o].Shape);

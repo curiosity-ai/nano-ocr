@@ -526,6 +526,20 @@ public sealed class InferenceSession
             fused.Inputs.Add(tr.Inputs[0]);
             fused.Outputs.AddRange([rmax.Outputs[0], amax.Outputs[0], rsum.Outputs[0]]);
             var gone = new HashSet<OnnxNode>([tr, rmax, amax, sub, nodes[ui], exp, rsum]);
+
+            // A plain 1×1, rank-3 convolution read only by the transpose (the CTC head itself)
+            // folds in too, so its logits never reach memory.
+            int ci = nodes.FindIndex(n => n.Outputs.Count == 1 && n.Outputs[0] == tr.Inputs[0]);
+            if (ci >= 0 && nodes[ci] is { OpType: "Conv" } conv && Readers(conv.Outputs[0]).Count == 1 && Private(conv.Outputs[0])
+                && conv.Inputs.Count <= 3 && !conv.Attributes.ContainsKey(Operators.FusedActivation)
+                && conv.Int("group", 1) == 1 && conv.Ints("kernel_shape") is [1] && (conv.Ints("strides") ?? [1]) is [1]
+                && (conv.Ints("pads") ?? [0, 0]) is [0, 0] && (conv.Ints("dilations") ?? [1]) is [1])
+            {
+                fused.OpType = "ConvSoftmaxPeak";
+                fused.Inputs.Clear();
+                fused.Inputs.AddRange(conv.Inputs);
+                gone.Add(conv);
+            }
             int at = gone.Max(n => nodes.IndexOf(n));
             var result = new List<OnnxNode>(nodes.Count);
             for (int k = 0; k < nodes.Count; k++)
