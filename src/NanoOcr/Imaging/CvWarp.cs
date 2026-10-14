@@ -70,6 +70,12 @@ public static class CvWarp
                 int row = y * w;
                 for (int x = 0; x < w; x++)
                 {
+                    if (Avx2.IsSupported && Fma.IsSupported && (x & 7) == 0 && x + 8 <= w && ReplicateGather8(s, w, h, m, mx, my, x, d, row))
+                    {
+                        x += 7;
+                        continue;
+                    }
+
                     float sx = MathF.FusedMultiplyAdd(m[0], x, mx);
                     float sy = MathF.FusedMultiplyAdd(m[3], x, my);
                     int ix = (int)MathF.Floor(sx), iy = (int)MathF.Floor(sy);
@@ -100,6 +106,56 @@ public static class CvWarp
             }
         });
         return dst;
+    }
+
+    /// <summary>
+    /// Eight pixels of <see cref="WarpReplicate"/> with AVX2 gathers when all their taps are inside
+    /// the image (and a row short of its end, so the 4-byte gathers stay inside the buffer); false
+    /// otherwise, and the caller does them one by one. A 32-bit gather at a tap's offset carries
+    /// both horizontal neighbours (bytes 0 and 1). The arithmetic per lane is the scalar path's —
+    /// the same fused multiply-adds, rounded half to even — so the output is identical.
+    /// </summary>
+    private static unsafe bool ReplicateGather8(byte[] src, int w, int h, float[] m, float mx, float my, int x, byte[] dst, int row)
+    {
+        Vector256<float> xs = Vector256.Create((float)x) + Vector256.Create(0f, 1, 2, 3, 4, 5, 6, 7);
+        Vector256<float> sx = Fma.MultiplyAdd(Vector256.Create(m[0]), xs, Vector256.Create(mx));
+        Vector256<float> sy = Fma.MultiplyAdd(Vector256.Create(m[3]), xs, Vector256.Create(my));
+        Vector256<float> fx = Avx.Floor(sx), fy = Avx.Floor(sy);
+        Vector256<int> ix = Avx.ConvertToVector256Int32WithTruncation(fx);
+        Vector256<int> iy = Avx.ConvertToVector256Int32WithTruncation(fy);
+
+        // 0 <= ix < w - 1 and 0 <= iy < h - 2 in every lane.
+        Vector256<int> inX = Avx2.AndNot(Avx2.CompareGreaterThan(Vector256<int>.Zero, ix), Avx2.CompareGreaterThan(Vector256.Create(w - 1), ix));
+        Vector256<int> inY = Avx2.AndNot(Avx2.CompareGreaterThan(Vector256<int>.Zero, iy), Avx2.CompareGreaterThan(Vector256.Create(h - 2), iy));
+        if (Avx.MoveMask(Avx2.And(inX, inY).AsSingle()) != 0xFF)
+        {
+            return false;
+        }
+
+        Vector256<int> o = Avx2.Add(Avx2.MultiplyLow(iy, Vector256.Create(w)), ix);
+        Vector256<int> top, bottom;
+        fixed (byte* s = src)
+        {
+            top = Avx2.GatherVector256((int*)s, o, 1);
+            bottom = Avx2.GatherVector256((int*)(s + w), o, 1);
+        }
+
+        var lowByte = Vector256.Create(0xFF);
+        Vector256<float> p00 = Avx.ConvertToVector256Single(Avx2.And(top, lowByte));
+        Vector256<float> p01 = Avx.ConvertToVector256Single(Avx2.And(Avx2.ShiftRightLogical(top, 8), lowByte));
+        Vector256<float> p10 = Avx.ConvertToVector256Single(Avx2.And(bottom, lowByte));
+        Vector256<float> p11 = Avx.ConvertToVector256Single(Avx2.And(Avx2.ShiftRightLogical(bottom, 8), lowByte));
+        Vector256<float> ax = sx - fx, ay = sy - fy;
+        Vector256<float> v0 = Fma.MultiplyAdd(ax, p01 - p00, p00);
+        Vector256<float> v1 = Fma.MultiplyAdd(ax, p11 - p10, p10);
+        Vector256<float> v = Fma.MultiplyAdd(ay, v1 - v0, v0);
+        Vector256<int> r = Avx.ConvertToVector256Int32(Vector256.Min(Vector256.Create(255f), Vector256.Max(Vector256<float>.Zero, Avx.RoundToNearestInteger(v))));
+        for (int i = 0; i < 8; i++)
+        {
+            dst[row + x + i] = (byte)r.GetElement(i);
+        }
+
+        return true;
     }
 
     /// <summary>
