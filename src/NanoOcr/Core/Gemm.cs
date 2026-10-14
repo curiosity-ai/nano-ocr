@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 namespace NanoOcr.Core;
 
@@ -24,6 +25,16 @@ public static unsafe class Gemm
 {
     private const int KBlock = 256;
     private const int NBlock = 256;
+
+    /// <summary>
+    /// Whether the 512-bit kernels run: the hardware has AVX-512 and the runtime accelerates it.
+    /// <see cref="Vector{T}"/> stays 256 bits wide on such machines by default, so the 256-bit
+    /// kernels would leave half of every FMA unit idle.
+    /// </summary>
+    public static readonly bool Wide = Vector512.IsHardwareAccelerated && Environment.GetEnvironmentVariable("NANOOCR_GEMM_256") != "1";
+
+    /// <summary>Columns of one packed strip of <c>B</c> (the micro-kernel's tile width).</summary>
+    internal static int StripWidth => Wide ? 32 : 2 * Vector<float>.Count;
 
     /// <summary>Computes <c>C[M,N] = A[M,K] · B[K,N]</c>, or adds it to <c>C</c> when <paramref name="accumulate"/>.</summary>
     public static void Multiply(
@@ -69,11 +80,10 @@ public static unsafe class Gemm
 
     private static void RunParallel(nint pa, int lda, nint pb, int ldb, nint pc, int ldc, int m, int n, int k, bool accumulate, int workers)
     {
-        int vw = Vector<float>.Count;
         if (n >= m || m < 8)
         {
             // Split the columns into chunks that are whole multiples of the tile width.
-            int step = 2 * vw;
+            int step = StripWidth;
             int chunks = Math.Min(workers * 4, Math.Max(1, n / step));
             int size = ((n + chunks - 1) / chunks + step - 1) / step * step;
             chunks = (n + size - 1) / size;
@@ -86,8 +96,9 @@ public static unsafe class Gemm
         }
         else
         {
-            int chunks = Math.Min(workers * 4, Math.Max(1, m / 6));
-            int size = ((m + chunks - 1) / chunks + 5) / 6 * 6;
+            int mr = Wide ? 8 : 6;
+            int chunks = Math.Min(workers * 4, Math.Max(1, m / mr));
+            int size = ((m + chunks - 1) / chunks + mr - 1) / mr * mr;
             chunks = (m + size - 1) / size;
             Parallel.For(0, chunks, Parallelism.Options, ci =>
             {
@@ -108,6 +119,12 @@ public static unsafe class Gemm
     /// </remarks>
     private static void Region(float* a, int lda, float* b, int ldb, float* c, int ldc, int i0, int i1, int j0, int j1, int k, bool accumulate)
     {
+        if (Wide && i1 - i0 >= 4)
+        {
+            Region512(a, lda, b, ldb, c, ldc, i0, i1, j0, j1, k, accumulate);
+            return;
+        }
+
         int nr = 2 * Vector<float>.Count;
         int rows = i1 - i0;
         if (rows < 6)
@@ -314,6 +331,277 @@ public static unsafe class Gemm
         {
             c[q] = t[q];
         }
+    }
+
+    /// <summary>
+    /// <see cref="Region"/> on 512-bit vectors: strips of 32 columns and an 8-row tile (sixteen
+    /// accumulators), with 4-, 2- and 1-row tiles for the remainder, so the channel counts these
+    /// models use (multiples of 8, and 1678 = 8·209 + 6) rarely leave a row to the 1-row kernel.
+    /// Every output is still one in-order FMA chain over k, so the results equal the 256-bit path's.
+    /// </summary>
+    private static void Region512(float* a, int lda, float* b, int ldb, float* c, int ldc, int i0, int i1, int j0, int j1, int k, bool accumulate)
+    {
+        const int nr = 32;
+        float[] buffer = System.Buffers.ArrayPool<float>.Shared.Rent(KBlock * (NBlock + nr));
+        try
+        {
+            fixed (float* packed = buffer)
+            {
+                for (int jb = j0; jb < j1; jb += NBlock)
+                {
+                    int je = Math.Min(j1, jb + NBlock);
+                    int strips = (je - jb + nr - 1) / nr;
+                    for (int kb = 0; kb < k; kb += KBlock)
+                    {
+                        int kc = Math.Min(KBlock, k - kb);
+                        bool add = accumulate || kb > 0;
+                        Pack(b + (kb * (long)ldb), ldb, jb, je, kc, nr, packed);
+                        for (int s = 0; s < strips; s++)
+                        {
+                            int js = jb + (s * nr);
+                            int width = Math.Min(nr, je - js);
+                            float* strip = packed + ((long)s * kc * nr);
+                            int i = i0;
+                            if (width == nr)
+                            {
+                                for (; i + 8 <= i1; i += 8)
+                                {
+                                    K512x8(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, add);
+                                }
+
+                                if (i + 4 <= i1)
+                                {
+                                    K512x4(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, add);
+                                    i += 4;
+                                }
+
+                                if (i + 2 <= i1)
+                                {
+                                    K512x2(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, add);
+                                    i += 2;
+                                }
+
+                                if (i < i1)
+                                {
+                                    K512x1(a + (i * (long)lda) + kb, strip, kc, c + (i * (long)ldc) + js, add);
+                                }
+                            }
+                            else
+                            {
+                                Edge512(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, i1 - i, width, add);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(buffer);
+        }
+    }
+
+    /// <summary>A strip narrower than 32 columns: through a scratch tile, eight rows at a time.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Edge512(float* a, int lda, float* bp, int kc, float* c, int ldc, int rows, int width, bool add)
+    {
+        const int nr = 32;
+        float* t = stackalloc float[8 * nr];
+        for (int r0 = 0; r0 < rows; r0 += 8)
+        {
+            int rr = Math.Min(8, rows - r0);
+            for (int r = 0; r < rr; r++)
+            {
+                for (int q = 0; q < nr; q++)
+                {
+                    t[(r * nr) + q] = add && q < width ? c[((r0 + r) * (long)ldc) + q] : 0f;
+                }
+            }
+
+            float* ar = a + (r0 * (long)lda);
+            int i = 0;
+            if (rr == 8)
+            {
+                K512x8(ar, lda, bp, kc, t, nr, add);
+                i = 8;
+            }
+
+            if (i + 4 <= rr)
+            {
+                K512x4(ar + (i * (long)lda), lda, bp, kc, t + (i * nr), nr, add);
+                i += 4;
+            }
+
+            if (i + 2 <= rr)
+            {
+                K512x2(ar + (i * (long)lda), lda, bp, kc, t + (i * nr), nr, add);
+                i += 2;
+            }
+
+            if (i < rr)
+            {
+                K512x1(ar + (i * (long)lda), bp, kc, t + (i * nr), add);
+            }
+
+            for (int r = 0; r < rr; r++)
+            {
+                for (int q = 0; q < width; q++)
+                {
+                    c[((r0 + r) * (long)ldc) + q] = t[(r * nr) + q];
+                }
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization | MethodImplOptions.NoInlining)]
+    private static void K512x8(float* a, int lda, float* bp, int kc, float* c, int ldc, bool add)
+    {
+        float* a0 = a, a1 = a + lda, a2 = a + (2 * lda), a3 = a + (3 * lda);
+        float* a4 = a + (4 * lda), a5 = a + (5 * lda), a6 = a + (6 * lda), a7 = a + (7 * lda);
+        Vector512<float> s00, s01, s10, s11, s20, s21, s30, s31, s40, s41, s50, s51, s60, s61, s70, s71;
+        if (add)
+        {
+            s00 = Vector512.Load(c); s01 = Vector512.Load(c + 16);
+            s10 = Vector512.Load(c + ldc); s11 = Vector512.Load(c + ldc + 16);
+            s20 = Vector512.Load(c + (2 * ldc)); s21 = Vector512.Load(c + (2 * ldc) + 16);
+            s30 = Vector512.Load(c + (3 * ldc)); s31 = Vector512.Load(c + (3 * ldc) + 16);
+            s40 = Vector512.Load(c + (4 * ldc)); s41 = Vector512.Load(c + (4 * ldc) + 16);
+            s50 = Vector512.Load(c + (5 * ldc)); s51 = Vector512.Load(c + (5 * ldc) + 16);
+            s60 = Vector512.Load(c + (6 * ldc)); s61 = Vector512.Load(c + (6 * ldc) + 16);
+            s70 = Vector512.Load(c + (7 * ldc)); s71 = Vector512.Load(c + (7 * ldc) + 16);
+        }
+        else
+        {
+            s00 = s01 = s10 = s11 = s20 = s21 = s30 = s31 = Vector512<float>.Zero;
+            s40 = s41 = s50 = s51 = s60 = s61 = s70 = s71 = Vector512<float>.Zero;
+        }
+
+        for (int p = 0; p < kc; p++, bp += 32)
+        {
+            Vector512<float> b0 = Vector512.Load(bp);
+            Vector512<float> b1 = Vector512.Load(bp + 16);
+            Vector512<float> v = Vector512.Create(a0[p]);
+            s00 = Vector512.FusedMultiplyAdd(v, b0, s00);
+            s01 = Vector512.FusedMultiplyAdd(v, b1, s01);
+            v = Vector512.Create(a1[p]);
+            s10 = Vector512.FusedMultiplyAdd(v, b0, s10);
+            s11 = Vector512.FusedMultiplyAdd(v, b1, s11);
+            v = Vector512.Create(a2[p]);
+            s20 = Vector512.FusedMultiplyAdd(v, b0, s20);
+            s21 = Vector512.FusedMultiplyAdd(v, b1, s21);
+            v = Vector512.Create(a3[p]);
+            s30 = Vector512.FusedMultiplyAdd(v, b0, s30);
+            s31 = Vector512.FusedMultiplyAdd(v, b1, s31);
+            v = Vector512.Create(a4[p]);
+            s40 = Vector512.FusedMultiplyAdd(v, b0, s40);
+            s41 = Vector512.FusedMultiplyAdd(v, b1, s41);
+            v = Vector512.Create(a5[p]);
+            s50 = Vector512.FusedMultiplyAdd(v, b0, s50);
+            s51 = Vector512.FusedMultiplyAdd(v, b1, s51);
+            v = Vector512.Create(a6[p]);
+            s60 = Vector512.FusedMultiplyAdd(v, b0, s60);
+            s61 = Vector512.FusedMultiplyAdd(v, b1, s61);
+            v = Vector512.Create(a7[p]);
+            s70 = Vector512.FusedMultiplyAdd(v, b0, s70);
+            s71 = Vector512.FusedMultiplyAdd(v, b1, s71);
+        }
+
+        s00.Store(c); s01.Store(c + 16);
+        s10.Store(c + ldc); s11.Store(c + ldc + 16);
+        s20.Store(c + (2 * ldc)); s21.Store(c + (2 * ldc) + 16);
+        s30.Store(c + (3 * ldc)); s31.Store(c + (3 * ldc) + 16);
+        s40.Store(c + (4 * ldc)); s41.Store(c + (4 * ldc) + 16);
+        s50.Store(c + (5 * ldc)); s51.Store(c + (5 * ldc) + 16);
+        s60.Store(c + (6 * ldc)); s61.Store(c + (6 * ldc) + 16);
+        s70.Store(c + (7 * ldc)); s71.Store(c + (7 * ldc) + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization | MethodImplOptions.NoInlining)]
+    private static void K512x4(float* a, int lda, float* bp, int kc, float* c, int ldc, bool add)
+    {
+        float* a0 = a, a1 = a + lda, a2 = a + (2 * lda), a3 = a + (3 * lda);
+        Vector512<float> s00, s01, s10, s11, s20, s21, s30, s31;
+        if (add)
+        {
+            s00 = Vector512.Load(c); s01 = Vector512.Load(c + 16);
+            s10 = Vector512.Load(c + ldc); s11 = Vector512.Load(c + ldc + 16);
+            s20 = Vector512.Load(c + (2 * ldc)); s21 = Vector512.Load(c + (2 * ldc) + 16);
+            s30 = Vector512.Load(c + (3 * ldc)); s31 = Vector512.Load(c + (3 * ldc) + 16);
+        }
+        else
+        {
+            s00 = s01 = s10 = s11 = s20 = s21 = s30 = s31 = Vector512<float>.Zero;
+        }
+
+        for (int p = 0; p < kc; p++, bp += 32)
+        {
+            Vector512<float> b0 = Vector512.Load(bp);
+            Vector512<float> b1 = Vector512.Load(bp + 16);
+            Vector512<float> v = Vector512.Create(a0[p]);
+            s00 = Vector512.FusedMultiplyAdd(v, b0, s00);
+            s01 = Vector512.FusedMultiplyAdd(v, b1, s01);
+            v = Vector512.Create(a1[p]);
+            s10 = Vector512.FusedMultiplyAdd(v, b0, s10);
+            s11 = Vector512.FusedMultiplyAdd(v, b1, s11);
+            v = Vector512.Create(a2[p]);
+            s20 = Vector512.FusedMultiplyAdd(v, b0, s20);
+            s21 = Vector512.FusedMultiplyAdd(v, b1, s21);
+            v = Vector512.Create(a3[p]);
+            s30 = Vector512.FusedMultiplyAdd(v, b0, s30);
+            s31 = Vector512.FusedMultiplyAdd(v, b1, s31);
+        }
+
+        s00.Store(c); s01.Store(c + 16);
+        s10.Store(c + ldc); s11.Store(c + ldc + 16);
+        s20.Store(c + (2 * ldc)); s21.Store(c + (2 * ldc) + 16);
+        s30.Store(c + (3 * ldc)); s31.Store(c + (3 * ldc) + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization | MethodImplOptions.NoInlining)]
+    private static void K512x2(float* a, int lda, float* bp, int kc, float* c, int ldc, bool add)
+    {
+        float* a0 = a, a1 = a + lda;
+        Vector512<float> s00, s01, s10, s11;
+        if (add)
+        {
+            s00 = Vector512.Load(c); s01 = Vector512.Load(c + 16);
+            s10 = Vector512.Load(c + ldc); s11 = Vector512.Load(c + ldc + 16);
+        }
+        else
+        {
+            s00 = s01 = s10 = s11 = Vector512<float>.Zero;
+        }
+
+        for (int p = 0; p < kc; p++, bp += 32)
+        {
+            Vector512<float> b0 = Vector512.Load(bp);
+            Vector512<float> b1 = Vector512.Load(bp + 16);
+            Vector512<float> v = Vector512.Create(a0[p]);
+            s00 = Vector512.FusedMultiplyAdd(v, b0, s00);
+            s01 = Vector512.FusedMultiplyAdd(v, b1, s01);
+            v = Vector512.Create(a1[p]);
+            s10 = Vector512.FusedMultiplyAdd(v, b0, s10);
+            s11 = Vector512.FusedMultiplyAdd(v, b1, s11);
+        }
+
+        s00.Store(c); s01.Store(c + 16);
+        s10.Store(c + ldc); s11.Store(c + ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization | MethodImplOptions.NoInlining)]
+    private static void K512x1(float* a, float* bp, int kc, float* c, bool add)
+    {
+        Vector512<float> s0 = add ? Vector512.Load(c) : Vector512<float>.Zero;
+        Vector512<float> s1 = add ? Vector512.Load(c + 16) : Vector512<float>.Zero;
+        for (int p = 0; p < kc; p++, bp += 32)
+        {
+            Vector512<float> v = Vector512.Create(a[p]);
+            s0 = Vector512.FusedMultiplyAdd(v, Vector512.Load(bp), s0);
+            s1 = Vector512.FusedMultiplyAdd(v, Vector512.Load(bp + 16), s1);
+        }
+
+        s0.Store(c);
+        s1.Store(c + 16);
     }
 
     /// <summary>The unpacked kernels, for blocks too short in rows for packing to pay.</summary>

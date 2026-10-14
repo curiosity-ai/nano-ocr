@@ -6,8 +6,8 @@ internal static class GemmBench
 {
     public static int Run()
     {
-        Console.WriteLine($"Vector<float>.Count = {System.Numerics.Vector<float>.Count}, hardware accelerated = {System.Numerics.Vector.IsHardwareAccelerated}");
-        foreach (var (m, n, k, serial) in new[] { (256, 134, 128, true), (128, 134, 256, true), (256, 134, 128, false), (512, 512, 512, true), (512, 512, 512, false), (64, 16384, 144, false), (256, 1742, 128, false), (128, 1742, 256, false), (1678, 1742, 128, false) })
+        Console.WriteLine($"Vector<float>.Count = {System.Numerics.Vector<float>.Count}, hardware accelerated = {System.Numerics.Vector.IsHardwareAccelerated}, 512-bit kernels = {Gemm.Wide}");
+        foreach (var (m, n, k, serial) in new[] { (256, 134, 128, true), (512, 512, 512, true), (256, 1742, 128, true), (128, 1742, 256, true), (1678, 1742, 128, true), (16, 51200, 144, true), (24, 51200, 72, true), (512, 512, 512, false), (1678, 1742, 128, false) })
         {
             var a = new float[m * k];
             var b = new float[k * n];
