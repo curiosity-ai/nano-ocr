@@ -23,6 +23,13 @@ public sealed class EngineOptions
 
     /// <summary>Read lines with math as LaTeX (slower on math pages).</summary>
     public bool Math { get; set; }
+
+    /// <summary>
+    /// Run the models with their element-wise nodes fused into the convolutions (the default; see
+    /// <see cref="InferenceSession.FusedNodes"/>). Off runs each graph as written — the same
+    /// results, slower; there for A/B comparisons.
+    /// </summary>
+    public bool Fusion { get; set; } = true;
 }
 
 /// <summary>
@@ -96,7 +103,7 @@ public sealed class NanoOcrEngine
 
         if (Options.Math)
         {
-            MathReader = MathReader.Load(store) ?? throw new ModelException("Math=true needs the math models.");
+            MathReader = MathReader.Load(store, Options.Fusion) ?? throw new ModelException("Math=true needs the math models.");
         }
 
         LongSide = meta.RootElement.GetProperty("det_long_side").GetInt32();
@@ -292,7 +299,7 @@ public sealed class NanoOcrEngine
         float[] input = System.Buffers.ArrayPool<float>.Shared.Rent(OrientSide * OrientSide);
         OrientInput(gray, OrientSide, input);
         Tensor x = Tensor.FromFloats(input, 1, 1, OrientSide, OrientSide);
-        Tensor[] outs = _orient.Run(new Dictionary<string, Tensor> { ["x"] = x });
+        Tensor[] outs = Run(_orient, new Dictionary<string, Tensor> { ["x"] = x });
         System.Buffers.ArrayPool<float>.Shared.Return(input);
         float[] p = outs[0].ToFloatArray();
         outs[0].Release();
@@ -329,7 +336,7 @@ public sealed class NanoOcrEngine
         (float[] ink, int h, int w, double s) = Detection.PageToInput(gray, longSide, pooled: true);
         scale = s;
         Tensor x = Tensor.FromFloats(ink, 1, 1, h, w);
-        Tensor[] outs = _det.Run(new Dictionary<string, Tensor> { ["x"] = x });
+        Tensor[] outs = Run(_det, new Dictionary<string, Tensor> { ["x"] = x });
         System.Buffers.ArrayPool<float>.Shared.Return(ink);
         Tensor o = outs[0];
         List<LineBox> boxes = Detection.Decode(o.Floats, o.Shape[2], o.Shape[3]);
@@ -401,7 +408,7 @@ public sealed class NanoOcrEngine
                 List<int> idx = part.Select(i => sel[i]).ToList();
                 (Tensor x, Tensor widths) = LineCrops.PadBatch(idx.Select(j => crops[j]).ToList());
                 int padded = x.Shape[3];
-                Tensor[] outs = session.Run(new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
+                Tensor[] outs = Run(session, new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
                 x.Release();
                 widths.Release();
                 Tensor best = outs[0], pmax = outs[1], lengths = outs[2];
@@ -484,7 +491,7 @@ public sealed class NanoOcrEngine
         foreach (List<int> idx in LineCrops.WidthBatches(crops.Select(c => c.Width).ToList(), batch))
         {
             (Tensor x, Tensor widths) = LineCrops.PadBatch(idx.Select(j => crops[j]).ToList());
-            Tensor[] outs = _script.Run(new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
+            Tensor[] outs = Run(_script, new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
             for (int k = 0; k < idx.Count; k++)
             {
                 result[idx[k]] = outs[0].Floats[k] > 0.5f;
@@ -630,7 +637,7 @@ public sealed class NanoOcrEngine
         float[] feats = ReadingOrder.LineFeatures(boxes, pageW, pageH, texts);
         var mask = new bool[n];
         Array.Fill(mask, true);
-        Tensor[] outs = _order.Run(new Dictionary<string, Tensor>
+        Tensor[] outs = Run(_order, new Dictionary<string, Tensor>
         {
             ["feats"] = Tensor.FromFloats(feats, 1, n, ReadingOrder.Features),
             ["mask"] = Tensor.FromBools(mask, 1, n),
@@ -691,6 +698,10 @@ public sealed class NanoOcrEngine
 
         return page;
     }
+
+    /// <summary>Runs a model the way <see cref="EngineOptions.Fusion"/> says.</summary>
+    private Tensor[] Run(InferenceSession session, Dictionary<string, Tensor> inputs) =>
+        Options.Fusion ? session.Run(inputs) : session.RunUnfused(inputs);
 
     internal static double Ms(long start) => Stopwatch.GetElapsedTime(start).TotalMilliseconds;
 

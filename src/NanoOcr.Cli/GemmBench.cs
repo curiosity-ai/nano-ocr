@@ -1,11 +1,16 @@
 using System.Diagnostics;
 using NanoOcr.Core;
 
-/// <summary><c>nano-ocr bench-gemm</c>: GEMM throughput at the shapes the models use.</summary>
+/// <summary><c>nano-ocr bench-gemm [--gemm-256]</c>: GEMM throughput at the shapes the models use.</summary>
 internal static class GemmBench
 {
-    public static int Run()
+    public static int Run(string[] args)
     {
+        if (args.Contains("--gemm-256"))
+        {
+            Gemm.Wide = false;
+        }
+
         Console.WriteLine($"Vector<float>.Count = {System.Numerics.Vector<float>.Count}, hardware accelerated = {System.Numerics.Vector.IsHardwareAccelerated}, 512-bit kernels = {Gemm.Wide}");
         foreach (var (m, n, k, serial) in new[] { (256, 134, 128, true), (512, 512, 512, true), (256, 1742, 128, true), (128, 1742, 256, true), (1678, 1742, 128, true), (32, 448, 144, true), (48, 224, 288, true), (48, 2048, 24, true), (512, 512, 512, false), (1678, 1742, 128, false) })
         {

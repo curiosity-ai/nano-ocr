@@ -25,12 +25,10 @@ public sealed class ModelStore
 
     /// <summary>
     /// The models in <paramref name="directory"/>; <see langword="null"/> or empty gives the
-    /// <c>NANO_OCR_MODEL_DIR</c> environment variable's folder (<c>INDRA_OCR_MODEL_DIR</c>, the
-    /// original's name, is still honoured), or else the embedded models.
+    /// embedded models.
     /// </summary>
     public static ModelStore FromDirectory(string? directory)
     {
-        directory = string.IsNullOrEmpty(directory) ? (Environment.GetEnvironmentVariable("NANO_OCR_MODEL_DIR") is { Length: > 0 } nano ? nano : Environment.GetEnvironmentVariable("INDRA_OCR_MODEL_DIR")) : directory;
         if (string.IsNullOrEmpty(directory))
         {
             return Embedded;

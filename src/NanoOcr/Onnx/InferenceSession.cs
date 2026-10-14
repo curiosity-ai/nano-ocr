@@ -56,7 +56,7 @@ public sealed class InferenceSession
         }
 
         _graphOutputs = new HashSet<string>(_graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
-        _fusedNodes = Environment.GetEnvironmentVariable("NANOOCR_NO_FUSION") == "1" ? _nodes : FuseSoftmaxPeak(Fuse(_nodes, _graphOutputs), _graphOutputs, _constants);
+        _fusedNodes = FuseSoftmaxPeak(Fuse(_nodes, _graphOutputs), _graphOutputs, _constants);
         _fusedKernels = _fusedNodes.Select(n => Operators.Resolve(n)!).ToArray();
         _plan = new Lazy<Plan>(() => BuildPlan(_nodes));
         _fusedPlan = new Lazy<Plan>(() => BuildPlan(_fusedNodes));

@@ -62,6 +62,9 @@ helpers (`encode_targets`, vocabulary builders, label canonicalization).
 - **Wider kernels must keep each output's FMA chain.** The 512-bit GEMM and depthwise kernels
   produce the 256-bit kernels' bits because every output is one in-order chain over k; a kernel
   that splits a reduction across lanes changes results and needs its own justification.
+- **Configuration is code, not environment.** Options live on `NanoOcrOptions`, `EngineOptions`,
+  `Parallelism` and `Gemm.Wide`; nothing reads environment variables (the original's
+  `INDRA_OCR_MODEL_DIR` included — pass `ModelDir`).
 - **Pooled buffers are not zeroed.** Everything from `ArrayPool<T>.Shared` (tensors, scratch,
   `GrayImage.Rent`) starts with garbage; a kernel that reads before writing must clear first (the
   INTER_AREA row sum and the summed-area table's first row are the examples in the code).
@@ -96,13 +99,15 @@ pools), times `--runs` pages **without** the operator profile (its per-node book
 inside the figure), prints each stage's best, median and spread, allocation and GC pauses per
 page, then sub-stages one at a time with their time and allocation (thumbnail, quarter turn,
 skew, orientation, upright, detect, crops, script, recognize, assemble), and finally a separate
-profiled pass per model (`BENCH_MODELS=rec` picks the models, `BENCH_TOP` the rows, `BENCH_MATH=1`
-the math reader). `nano-ocr bench-gemm` prints GEMM throughput at the models' shapes.
+profiled pass per model (`--models rec` picks the models, `--top N` the rows, `--math` adds the
+math reader). `nano-ocr bench-gemm` prints GEMM throughput at the models' shapes.
 
-Two switches exist for A/B runs: `NANOOCR_GEMM_256=1` (the 256-bit GEMM kernels instead of the
-512-bit ones) and `NANOOCR_NO_FUSION=1` (run graphs as written). For an A/B against older code,
-build it in a `git worktree` with the current `Bench.cs`/`MachineProfile.cs` copied in and
-alternate the two binaries.
+Two switches exist for A/B runs, both set in code — **the library reads no environment
+variables**: `Gemm.Wide = false` selects the 256-bit kernels instead of the 512-bit ones, and
+`EngineOptions.Fusion = false` (or `NanoOcrOptions.Fusion`) runs the graphs as written. The bench
+exposes them as `--gemm-256` and `--no-fusion` (`bench-gemm` takes `--gemm-256` too). For an A/B
+against older code, build it in a `git worktree` with the current `Bench.cs`/`MachineProfile.cs`
+copied in and alternate the two binaries.
 
 The per-operator profile **overstates small, fused operators** (a stopwatch per node, and it
 runs in its own pass): it put `ConvSoftmaxPeak` at 26-29 ms where instrumentation inside the
@@ -125,7 +130,7 @@ Stage by stage, 1 thread: orientation + deskew 98-102 → 41-44 ms, detection 11
 recognition 240-250 → 113-121 (script model 36 → 14), assembly/order 5.6 → 2.6. The other test
 pages, 1 thread: skewed 519-534 → 226 ms (it is the one that rotates the full page), rotated
 488-491 → 228-250, Chinese 203-207 → 86-88, math 170-171 → 76-79, and the math page with the
-math reader (`BENCH_MATH=1`) 561-574 → 294-318. Every parity test passes throughout: model
+math reader (`--math`) 561-574 → 294-318. Every parity test passes throughout: model
 outputs within the ONNX Runtime tolerance (margins unchanged), every image operation byte-exact
 against OpenCV, every line, token and markdown identical. The CLI's markdown for all 24 files of
 `tests/data/documents` (images, PDFs, TIFFs, with and without `--math`) is byte-identical between

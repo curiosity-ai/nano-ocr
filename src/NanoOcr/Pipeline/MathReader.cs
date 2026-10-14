@@ -28,8 +28,11 @@ public sealed class MathReader
     private readonly string[] _itos;
     private readonly HashSet<string> _initInputs, _stepInputs;
 
-    private MathReader(ModelStore store)
+    private readonly bool _fusion;
+
+    private MathReader(ModelStore store, bool fusion)
     {
+        _fusion = fusion;
         _cls = store.Session("mathcls");
         _enc = store.Session("math_enc");
         _init = store.Session("math_dec_init");
@@ -62,11 +65,16 @@ public sealed class MathReader
     public int HeadDim { get; }
 
     /// <summary>The reader, or <see langword="null"/> when the store lacks a math model.</summary>
-    public static MathReader? Load(ModelStore store)
+    /// <param name="store">Where the models come from.</param>
+    /// <param name="fusion">Run the models fused (the default) or as written; see <see cref="EngineOptions.Fusion"/>.</param>
+    public static MathReader? Load(ModelStore store, bool fusion = true)
     {
         string[] files = ["mathcls.onnx", "math_enc.onnx", "math_dec_init.onnx", "math_dec_step.onnx", "math_meta.json"];
-        return files.All(store.Has) ? new MathReader(store) : null;
+        return files.All(store.Has) ? new MathReader(store, fusion) : null;
     }
+
+    private Tensor[] Run(InferenceSession session, Dictionary<string, Tensor> inputs) =>
+        _fusion ? session.Run(inputs) : session.RunUnfused(inputs);
 
     /// <summary>
     /// <c>detokenize</c>: tokens to text; inside math (between <c>$</c> tokens) they are joined by spaces.
@@ -113,7 +121,7 @@ public sealed class MathReader
         foreach (List<int> idx in LineCrops.WidthBatches(crops.Select(c => c.Width).ToList(), batch))
         {
             (Tensor x, Tensor widths) = LineCrops.PadBatch(idx.Select(j => crops[j]).ToList());
-            Tensor[] outs = _cls.Run(new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
+            Tensor[] outs = Run(_cls, new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
             for (int k = 0; k < idx.Count; k++)
             {
                 result[idx[k]] = outs[0].Floats[k] > MathMin;
@@ -136,12 +144,12 @@ public sealed class MathReader
         foreach (List<int> idx in LineCrops.WidthBatches(crops.Select(c => c.Width).ToList(), batch, maxRatio: 4.0, maxArea: 16 * 64 * 640))
         {
             (Tensor x, Tensor widths) = LineCrops.PadBatch(idx.Select(j => crops[j]).ToList());
-            Tensor[] enc = _enc.Run(new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
+            Tensor[] enc = Run(_enc, new Dictionary<string, Tensor> { ["x"] = x, ["widths"] = widths });
             x.Release();
             widths.Release();
             Tensor memory = enc[0], mask = enc[1];
             var feed = new Dictionary<string, Tensor> { ["memory"] = memory, ["mask"] = mask };
-            Tensor[] init = _init.Run(feed.Where(kv => _initInputs.Contains(kv.Key)).ToDictionary());
+            Tensor[] init = Run(_init, feed.Where(kv => _initInputs.Contains(kv.Key)).ToDictionary());
             Tensor ck = init[0], cv = init[1];
             int b = idx.Count;
             Tensor sk = Tensor.Float([Layers, b, Heads, 0, HeadDim]);
@@ -163,7 +171,7 @@ public sealed class MathReader
                     ["cross_v"] = cv,
                     ["mask"] = mask,
                 };
-                Tensor[] outs = _step.Run(step.Where(kv => _stepInputs.Contains(kv.Key)).ToDictionary());
+                Tensor[] outs = Run(_step, step.Where(kv => _stepInputs.Contains(kv.Key)).ToDictionary());
                 Tensor logits = outs[0];
                 sk.Release();
                 sv.Release();

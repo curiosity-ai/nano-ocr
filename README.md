@@ -70,8 +70,11 @@ foreach (var (path, pages, error) in ocr.PredictMany(files, cores: 8))
 | `Furniture` | false | keep page headers and footers in the markdown |
 | `Math` | false | read math as LaTeX (`$...$`); slower on math pages |
 | `Threads` | all cores | kernel threads for one page |
-| `ModelDir` | embedded | a folder laid out like the Hugging Face repository instead (`NANO_OCR_MODEL_DIR` also works, as does the original's `INDRA_OCR_MODEL_DIR`) |
+| `ModelDir` | embedded | a folder laid out like the Hugging Face repository instead |
 | `KeepImages` | false | keep page images on the results (for `SaveToImg`) |
+| `Fusion` | true | run the models with element-wise nodes fused into the convolutions; false runs the graphs as written (same results, slower) |
+
+Everything is configured in code; the library reads no environment variables.
 
 Stage-level access is public too: `NanoOcrEngine` (the port of `OrtOCR`: `Detect`, `Recognize`,
 `Upright`, `Assemble`, …), `DocumentConverter`, `NanoOcr.Onnx.InferenceSession` (run any of the

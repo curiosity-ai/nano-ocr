@@ -11,7 +11,7 @@ namespace NanoOcr;
 /// <summary>Options of <see cref="NanoOCR"/> (the arguments of Python's <c>indra_ocr.load</c>).</summary>
 public sealed class NanoOcrOptions
 {
-    /// <summary>A folder with the models; <see langword="null"/> uses the embedded models (or <c>NANO_OCR_MODEL_DIR</c>).</summary>
+    /// <summary>A folder with the models; <see langword="null"/> uses the embedded models.</summary>
     public string? ModelDir { get; set; }
 
     /// <summary>Threads the kernels use for one page (default: all cores).</summary>
@@ -43,6 +43,12 @@ public sealed class NanoOcrOptions
 
     /// <summary>Keep each page image on its result (needed by <see cref="OcrResult.SaveToImg"/>).</summary>
     public bool KeepImages { get; set; }
+
+    /// <summary>
+    /// Run the models with their element-wise nodes fused into the convolutions (the default). Off
+    /// runs each graph as written — same results, slower; there for comparisons.
+    /// </summary>
+    public bool Fusion { get; set; } = true;
 }
 
 /// <summary>
@@ -76,6 +82,7 @@ public sealed class NanoOCR : IDisposable
             Furniture = Options.Furniture,
             Math = Options.Math,
             TableHeads = Options.TableHeads,
+            Fusion = Options.Fusion,
         });
         _converter = new DocumentConverter(Engine, Options.Dpi, Options.Mode, Options.PdfOrder, Options.ImageOcr);
     }

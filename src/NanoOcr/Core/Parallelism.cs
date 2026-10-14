@@ -13,7 +13,7 @@ namespace NanoOcr.Core;
 /// The setting is ambient (an <see cref="AsyncLocal{T}"/>) rather than a parameter because the
 /// kernels sit several layers below the pipeline. A caller that runs several pages at once —
 /// <c>NanoOCR.PredictMany</c> runs one page per core — scopes the kernels inside each page to
-/// a single thread with <see cref="Use"/>, which is how Python's one-process-per-core pool
+/// a single thread with <see cref="Use(ParallelOptions)"/>, which is how Python's one-process-per-core pool
 /// is reproduced without processes.
 /// </para>
 /// </remarks>

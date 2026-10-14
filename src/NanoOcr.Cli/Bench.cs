@@ -5,8 +5,8 @@ using NanoOcr.Onnx;
 using NanoOcr.Pipeline;
 
 /// <summary>
-/// <c>nano-ocr bench page.png [--runs N] [--threads T] [--warmup W]</c>: warm runs of the OCR
-/// path on one page, best of N with the spread, per stage and per ONNX operator.
+/// <c>nano-ocr bench page.png [options]</c>: warm runs of the OCR path on one page, best of N
+/// with the spread, per stage and per ONNX operator.
 /// </summary>
 /// <remarks>
 /// The run starts with a <see cref="MachineProfile"/> header (CPU, ISA, FMA and read ceilings,
@@ -16,13 +16,41 @@ using NanoOcr.Pipeline;
 /// </remarks>
 internal static class Bench
 {
+    public const string Usage = """
+        usage: nano-ocr bench page.png [options]
+
+          --runs N          timed pages (default 7)
+          --warmup N        untimed pages first (default 3)
+          --threads N       kernel threads (default: all cores)
+          --math            include the math reader
+          --models a,b,...  models in the operator profile (default det,rec,order,orient,script,rec_cjk)
+          --top N           operator rows per model (default 12)
+          --no-machine      skip the machine header
+          --no-fusion       run the graphs as written (EngineOptions.Fusion = false)
+          --gemm-256        the 256-bit kernels where 512-bit ones would run (Gemm.Wide = false)
+        """;
+
+    private static readonly string[] ValueFlags = ["--runs", "--warmup", "--threads", "--models", "--top"];
+
     public static int Run(string[] args)
     {
-        string path = args.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal))
-            ?? throw new ArgumentException("bench needs an image");
+        string? path = args.Where((a, i) => !a.StartsWith("--", StringComparison.Ordinal) && (i == 0 || !ValueFlags.Contains(args[i - 1]))).FirstOrDefault();
+        if (path is null || args.Contains("--help") || args.Contains("-h"))
+        {
+            Console.WriteLine(Usage);
+            return path is null ? 2 : 0;
+        }
+
         int runs = Arg(args, "--runs", 7);
         int threads = Arg(args, "--threads", Environment.ProcessorCount);
         int warmup = Arg(args, "--warmup", 3);
+        int top = Arg(args, "--top", 12);
+        string[] models = (StringArg(args, "--models") ?? "det,rec,order,orient,script,rec_cjk").Split(",");
+        if (args.Contains("--gemm-256"))
+        {
+            NanoOcr.Core.Gemm.Wide = false;
+        }
+
         if (!args.Contains("--no-machine"))
         {
             Console.WriteLine(MachineProfile.Measure().Describe());
@@ -30,7 +58,7 @@ internal static class Bench
 
         GrayImage gray = ImageIO.ReadPages(path)[0];
         long c0 = Stopwatch.GetTimestamp();
-        var engine = new NanoOcrEngine(new EngineOptions { Math = Environment.GetEnvironmentVariable("BENCH_MATH") == "1" });
+        var engine = new NanoOcrEngine(new EngineOptions { Math = args.Contains("--math"), Fusion = !args.Contains("--no-fusion") });
         double load = Stopwatch.GetElapsedTime(c0).TotalMilliseconds;
         using var _ = NanoOcr.Core.Parallelism.Use(threads);
         c0 = Stopwatch.GetTimestamp();
@@ -99,7 +127,6 @@ internal static class Bench
         Stage("script", "(the script model)", () => engine.HanziLines(crops));
         Stage("recognize", "(rec_ms: crops + script + recognizer)", () => engine.Recognize(up, boxes));
         Stage("assemble", "(order_ms)", () => engine.Assemble(up.Width, up.Height, boxes, rec, []));
-        string[] models = (Environment.GetEnvironmentVariable("BENCH_MODELS") ?? "det,rec,order,orient,script,rec_cjk").Split(",");
         var profiles = models.ToDictionary(m => m, _ => new Dictionary<string, double>());
         foreach (string m in models)
         {
@@ -116,7 +143,6 @@ internal static class Bench
             NanoOcr.Models.ModelStore.Embedded.Session(m).Profile = null;
         }
 
-        int top = int.Parse(Environment.GetEnvironmentVariable("BENCH_TOP") ?? "12", CultureInfo.InvariantCulture);
         Console.WriteLine($"  operators (profiled pass of {runs} pages, per page):");
         foreach (var (m, ops) in profiles)
         {
@@ -140,6 +166,12 @@ internal static class Bench
     {
         var s = v.Order().ToList();
         return s[s.Count / 2];
+    }
+
+    private static string? StringArg(string[] args, string name)
+    {
+        int i = Array.IndexOf(args, name);
+        return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
     }
 
     private static int Arg(string[] args, string name, int fallback)

@@ -26,12 +26,29 @@ public static unsafe class Gemm
     private const int KBlock = 256;
     private const int NBlock = 256;
 
+    private static bool _wide = Vector512.IsHardwareAccelerated;
+
     /// <summary>
-    /// Whether the 512-bit kernels run: the hardware has AVX-512 and the runtime accelerates it.
-    /// <see cref="Vector{T}"/> stays 256 bits wide on such machines by default, so the 256-bit
-    /// kernels would leave half of every FMA unit idle.
+    /// Whether the 512-bit kernels run (GEMM, depthwise, the fused CTC head, HardSwish). On by
+    /// default wherever <see cref="Vector512.IsHardwareAccelerated"/>: <see cref="Vector{T}"/>
+    /// stays 256 bits wide on such machines, so the 256-bit kernels would leave half of every FMA
+    /// unit idle. Setting it to <see langword="false"/> selects the 256-bit kernels (same results,
+    /// for comparisons); it cannot be turned on where 512-bit vectors are not accelerated. Set it
+    /// before running models, not while they run.
     /// </summary>
-    public static readonly bool Wide = Vector512.IsHardwareAccelerated && Environment.GetEnvironmentVariable("NANOOCR_GEMM_256") != "1";
+    public static bool Wide
+    {
+        get => _wide;
+        set
+        {
+            if (value && !Vector512.IsHardwareAccelerated)
+            {
+                throw new PlatformNotSupportedException("512-bit vectors are not hardware accelerated on this machine.");
+            }
+
+            _wide = value;
+        }
+    }
 
     /// <summary>Columns of one packed strip of <c>B</c> (the micro-kernel's tile width).</summary>
     internal static int StripWidth => Wide ? 32 : 2 * Vector<float>.Count;
@@ -78,12 +95,13 @@ public static unsafe class Gemm
     /// Each output is the same in-order FMA chain as <see cref="Multiply"/> computes. Requires the
     /// 512-bit kernels (<see cref="Wide"/>).
     /// </summary>
-    /// <param name="rowScale">
-    /// Optional, <c>batch·k</c> long: row p of <c>B_i</c> is read as <c>B_i[p, ·] · rowScale[i·k + p]</c>
-    /// (one rounded multiply per element, applied while packing) — a per-item, per-channel gate on
-    /// the convolution's input, such as a squeeze-excite output, without a pass over the input.
-    /// </param>
-    /// <param name="epilogue">Applied to each finished 32-column strip while it is in L1 (see <see cref="StripEpilogue"/>).</param>
+    /// <remarks>
+    /// <c>rowScale</c>, optional and <c>batch·k</c> long, reads row p of <c>B_i</c> as
+    /// <c>B_i[p, ·] · rowScale[i·k + p]</c> (one rounded multiply per element, applied while
+    /// packing) — a per-item, per-channel gate on the convolution's input, such as a squeeze-excite
+    /// output, without a pass over the input. <c>epilogue</c> is applied to each finished 32-column
+    /// strip while it is in L1 (see <see cref="StripEpilogue"/>).
+    /// </remarks>
     public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride, bool accumulate = false, ReadOnlySpan<float> rowScale = default, StripEpilogue epilogue = default)
     {
         if (!Wide)
@@ -105,7 +123,7 @@ public static unsafe class Gemm
         }
     }
 
-    /// <summary>How logical columns map to memory: <see cref="Len"/> columns per item, items <see cref="BStride"/> / <see cref="CStride"/> apart.</summary>
+    /// <summary>How logical columns map to memory: <c>Len</c> columns per item, items <c>BStride</c> / <c>CStride</c> apart.</summary>
     /// <summary>
     /// What <see cref="MultiplyBatched"/> does to each output element once its sum is complete,
     /// in this order: add <c>Bias[row]</c>, add the residual at the same offset as the output,
