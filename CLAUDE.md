@@ -150,7 +150,6 @@ thread — the small batches gained nothing and the big ones ~1.8×. Measured in
 | page, 4 threads | 138-157 ms | **106-128 ms** |
 | page, 1 thread | 210-223 ms | 209-219 ms (unchanged, as intended) |
 | recognition, 4 threads | 84-100 ms | 47-57 ms |
-| cold CLI run, one page | 1.15-1.21 s | 0.94-1.05 s |
 
 What moved it (outputs unchanged: the CLI's markdown for all 24 test files at 1 and 4 cores, with
 and without `--math`, is byte-identical to `main`):
@@ -164,12 +163,14 @@ and without `--math`, is byte-identical to `main`):
   as given while the orientation model runs; a page the model turns is deskewed again after the
   turn (same result either way). Upright pages: orientation + deskew 20-22 → ~18 ms at 4 threads;
   a turned page pays for the discarded estimate.
-- **JIT for the CLI**: tiering on, `TieredCompilationQuickJitForLoops=false` (every kernel has
-  loops, so it is optimised from its first call), `TieredPGO=false`. The loop-free rest starts
-  cheap. Cold page ~15% faster, warm throughput the same at 1 and 4 threads.
 
-Many pages (`PredictMany`, one page per core) are bound by the cold start; twelve pages on four
-cores measured 2.0-2.2 s against 2.1-2.5 s for `main`.
+The bench now reports **cores busy** (process CPU time over wall time) for the timed pages and for
+each sub-stage. At 4 threads a warm page keeps ~2.4 cores busy — recognition 2.5, the upright
+stage 2.5, the script model 2.8, detection 1.9 — against the 2.1-2.8× this VM's four vCPUs deliver
+when all are loaded, and the CPU time per page rises from ~200 core-ms on one thread to ~240 on
+four. Warm multi-threaded time is therefore close to this machine's ceiling, and the remaining lever
+is doing less work per page, not filling more cores. (Cold start is out of scope: only warm
+throughput is measured and optimised.)
 
 ### What moved it (single thread)
 
@@ -226,8 +227,8 @@ folding.
 
 - **ReadyToRun for the CLI.** One page 1.49-1.52 s against 1.63-1.75 s JIT, but twelve pages
   4.05-4.40 s against 3.70-4.01 s, interleaved: the precompiled code targets a baseline ISA and the
-  hot kernels re-JIT anyway. Kept: JIT (then with `TieredCompilation=false`; tiering with its
-  defaults was worse still, 4.6-5.1 s — now tiering with loops optimised up front, see above).
+  hot kernels re-JIT anyway. Kept: JIT with `TieredCompilation=false` (tiering on was worse still:
+  4.6-5.1 s).
 - **A pointer-based scalar warp** (no bounds checks) instead of the AVX2 gathers: 222-235 ms
   against 97-123 ms for the gathers, single-threaded, interleaved — no better than the checked
   scalar loop (218-221 ms). The scalar per-pixel cost is in the float→int conversions and
@@ -257,6 +258,12 @@ folding.
 - **Rounding `Parallelism.Jobs` shares up** (`ceiling` instead of `round`, so the second-largest
   batch gets two threads rather than one): recognition 47-58 ms against 44-56, no separation in
   three interleaved rounds. Kept `round`, which oversubscribes less.
+- **Parallelizing detection's serial edges** (the ink map of the detector input by rows, decode's
+  sigmoid and threshold by element — both order-independent) together with **handing a finished
+  batch's threads to the batches still running** in `Parallelism.Jobs` (each job's
+  `ParallelOptions` is re-read at every kernel region): 4 threads, interleaved, 96-120 ms before
+  against 94-108 after, cores busy 2.4 either way. Within noise on a machine at its ceiling;
+  reverted to keep the code simple.
 - **Smaller late layers of the orientation model** still scale poorly (17.8 → 13.4 ms at 4
   threads): at 96×96 and 48×48 the parallel regions cost about what they save. Overlapping the
   model with the deskew estimate was the better use of the threads.
