@@ -483,9 +483,14 @@ internal static partial class Operators
                         {
                             ReadOnlySpan<float> src = plane.Slice(iy * p.W, p.W);
                             int ix = (ox * p.Sw) - p.Pl + (kx * p.Dw);
-                            if (p.Sw == 1 && ix >= 0 && ix + run <= p.W)
+                            if (p.Sw == 1)
                             {
-                                src.Slice(ix, run).CopyTo(dst.Slice(i, run));
+                                // In-bounds middle copied, padding at either end zeroed.
+                                int lead = Math.Clamp(-ix, 0, run);
+                                int end = Math.Clamp(p.W - ix, lead, run);
+                                dst.Slice(i, lead).Clear();
+                                src.Slice(ix + lead, end - lead).CopyTo(dst.Slice(i + lead, end - lead));
+                                dst.Slice(i + end, run - end).Clear();
                             }
                             else
                             {
