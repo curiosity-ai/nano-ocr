@@ -1,0 +1,25 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>preview</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TieredPGO>true</TieredPGO>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);SYSLIB1045</NoWarn>
+  </PropertyGroup>
+
+  <!-- Package metadata shared by every project that ships to NuGet. -->
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Company>Curiosity GmbH</Company>
+    <Authors>Curiosity GmbH and the Indra OCR authors</Authors>
+    <Product>NanoOcrSharp</Product>
+    <Description>NanoOCR: a pure C# port of the Indra OCR pipeline (line detection, CTC recognition, reading order, layout and markdown). No ONNX Runtime, no OpenCV.</Description>
+    <Copyright>Copyright (c) 2026 Curiosity GmbH; Copyright (c) Datalab</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageTags>ocr;nanoocr;indra;document-parsing;layout;markdown;pdf</PackageTags>
+  </PropertyGroup>
+</Project>

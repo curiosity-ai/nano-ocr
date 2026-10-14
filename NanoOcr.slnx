@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NanoOcr/NanoOcr.csproj" />
+    <Project Path="src/NanoOcr.Cli/NanoOcr.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NanoOcr.Tests/NanoOcr.Tests.csproj" />
+  </Folder>
+</Solution>
