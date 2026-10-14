@@ -5,9 +5,15 @@ using NanoOcr.Onnx;
 using NanoOcr.Pipeline;
 
 /// <summary>
-/// <c>nano-ocr bench page.png [--runs N] [--threads T]</c>: warm runs of the OCR path on one
-/// page, best of N with the spread, per stage and per ONNX operator.
+/// <c>nano-ocr bench page.png [--runs N] [--threads T] [--warmup W]</c>: warm runs of the OCR
+/// path on one page, best of N with the spread, per stage and per ONNX operator.
 /// </summary>
+/// <remarks>
+/// The run starts with a <see cref="MachineProfile"/> header (CPU, ISA, FMA and read ceilings,
+/// jitter), so two runs are only compared when their headers agree. The timed runs follow
+/// <c>--warmup</c> untimed ones (tiering, pools) and run without the operator profile, whose
+/// per-node bookkeeping would otherwise be inside the figure; the profile is a separate pass.
+/// </remarks>
 internal static class Bench
 {
     public static int Run(string[] args)
@@ -16,6 +22,12 @@ internal static class Bench
             ?? throw new ArgumentException("bench needs an image");
         int runs = Arg(args, "--runs", 7);
         int threads = Arg(args, "--threads", Environment.ProcessorCount);
+        int warmup = Arg(args, "--warmup", 3);
+        if (!args.Contains("--no-machine"))
+        {
+            Console.WriteLine(MachineProfile.Measure().Describe());
+        }
+
         GrayImage gray = ImageIO.ReadPages(path)[0];
         long c0 = Stopwatch.GetTimestamp();
         var engine = new NanoOcrEngine(new EngineOptions { Math = Environment.GetEnvironmentVariable("BENCH_MATH") == "1" });
@@ -24,15 +36,14 @@ internal static class Bench
         c0 = Stopwatch.GetTimestamp();
         engine.Process(gray); // warm-up: tiering, pools
         double first = Stopwatch.GetElapsedTime(c0).TotalMilliseconds;
-        engine.Process(gray);
-        Console.WriteLine($"cold: engine {load:0} ms, first page {first:0} ms");
+        for (int i = 0; i < warmup; i++)
+        {
+            engine.Process(gray);
+        }
+
+        Console.WriteLine($"cold: engine {load:0} ms, first page {first:0} ms; {warmup} warm-up runs");
 
         var samples = new Dictionary<string, List<double>>();
-        var ops = new Dictionary<string, double>();
-        foreach (string m in (Environment.GetEnvironmentVariable("BENCH_MODELS") ?? "det,rec,order,orient,script,rec_cjk").Split(","))
-        {
-            NanoOcr.Models.ModelStore.Embedded.Session(m).Profile = ops;
-        }
 
         long alloc0 = GC.GetTotalAllocatedBytes(precise: true);
         int gc0 = GC.CollectionCount(0), gc2 = GC.CollectionCount(2);
@@ -92,11 +103,38 @@ internal static class Bench
         Console.WriteLine($"  {"recognize",-10} best {recog.Min(),8:0.0} ms   (crops + script + recognizer)");
         Console.WriteLine($"  {"skew",-10} best {skew.Min(),8:0.0} ms   (inside orient_ms)");
         Console.WriteLine($"  {"orient",-10} best {orient.Min(),8:0.0} ms   (the model alone)");
-        double total = ops.Where(kv => !kv.Key.StartsWith('#')).Sum(kv => kv.Value);
-        Console.WriteLine($"  operators (sum over all runs, {total / runs:0.0} ms per run):");
-        foreach (var (k, v) in ops.Where(kv => !kv.Key.StartsWith('#')).OrderByDescending(kv => kv.Value).Take(int.Parse(Environment.GetEnvironmentVariable("BENCH_TOP") ?? "15")))
+        string[] models = (Environment.GetEnvironmentVariable("BENCH_MODELS") ?? "det,rec,order,orient,script,rec_cjk").Split(",");
+        var profiles = models.ToDictionary(m => m, _ => new Dictionary<string, double>());
+        foreach (string m in models)
         {
-            Console.WriteLine($"    {k,-28} {v / runs,8:0.0} ms  {v / total,6:P1}  {ops["#" + k] / runs,6:0} calls");
+            NanoOcr.Models.ModelStore.Embedded.Session(m).Profile = profiles[m];
+        }
+
+        for (int r = 0; r < runs; r++)
+        {
+            engine.Process(gray);
+        }
+
+        foreach (string m in models)
+        {
+            NanoOcr.Models.ModelStore.Embedded.Session(m).Profile = null;
+        }
+
+        int top = int.Parse(Environment.GetEnvironmentVariable("BENCH_TOP") ?? "12", CultureInfo.InvariantCulture);
+        Console.WriteLine($"  operators (profiled pass of {runs} pages, per page):");
+        foreach (var (m, ops) in profiles)
+        {
+            double total = ops.Where(kv => !kv.Key.StartsWith('#')).Sum(kv => kv.Value);
+            if (total == 0)
+            {
+                continue;
+            }
+
+            Console.WriteLine($"   {m}: {total / runs:0.0} ms");
+            foreach (var (k, v) in ops.Where(kv => !kv.Key.StartsWith('#')).OrderByDescending(kv => kv.Value).Take(top))
+            {
+                Console.WriteLine($"    {k,-34} {v / runs,8:0.00} ms  {v / total,6:P1}  {ops["#" + k] / runs,6:0} calls");
+            }
         }
 
         return 0;
