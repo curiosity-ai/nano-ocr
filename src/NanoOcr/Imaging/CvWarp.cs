@@ -181,20 +181,20 @@ public static class CvWarp
         const int Chunk = 32;
         float mx = (y * m[1]) + m[2];
         float my = (y * m[4]) + m[5];
+
+        // The whole row first: a blank source band needs no chunk tests and no zeros written,
+        // because the caller does not read a row this returns false for.
+        if (!Touches(m, mx, my, 0, w, w, h, nonzero))
+        {
+            return false;
+        }
+
         bool any = false;
         for (int x0 = 0; x0 < w; x0 += Chunk)
         {
             int x1 = Math.Min(w, x0 + Chunk);
 
-            // The map is affine and the fused step is monotonic in x, so the chunk's source
-            // positions lie between its two ends; one pixel of margin covers the second tap.
-            float sxa = MathF.FusedMultiplyAdd(m[0], x0, mx), sxb = MathF.FusedMultiplyAdd(m[0], x1 - 1, mx);
-            float sya = MathF.FusedMultiplyAdd(m[3], x0, my), syb = MathF.FusedMultiplyAdd(m[3], x1 - 1, my);
-            int cx0 = Math.Max(0, (int)MathF.Floor(MathF.Min(sxa, sxb)) - 1);
-            int cx1 = Math.Min(w, (int)MathF.Floor(MathF.Max(sxa, sxb)) + 3);
-            int cy0 = Math.Max(0, (int)MathF.Floor(MathF.Min(sya, syb)) - 1);
-            int cy1 = Math.Min(h, (int)MathF.Floor(MathF.Max(sya, syb)) + 3);
-            if (cx0 >= cx1 || cy0 >= cy1 || CountNonzero(nonzero, w, cx0, cy0, cx1, cy1) == 0)
+            if (!Touches(m, mx, my, x0, x1, w, h, nonzero))
             {
                 row.Slice(x0, x1 - x0).Clear();
                 continue;
@@ -205,6 +205,22 @@ public static class CvWarp
         }
 
         return any;
+    }
+
+    /// <summary>
+    /// Whether output columns <c>[x0, x1)</c> of a row can read a nonzero source pixel. The map is
+    /// affine and the fused step is monotonic in x, so the source positions lie between the two
+    /// ends; one pixel of margin covers the second tap and rounding.
+    /// </summary>
+    private static bool Touches(float[] m, float mx, float my, int x0, int x1, int w, int h, int[] nonzero)
+    {
+        float sxa = MathF.FusedMultiplyAdd(m[0], x0, mx), sxb = MathF.FusedMultiplyAdd(m[0], x1 - 1, mx);
+        float sya = MathF.FusedMultiplyAdd(m[3], x0, my), syb = MathF.FusedMultiplyAdd(m[3], x1 - 1, my);
+        int cx0 = Math.Max(0, (int)MathF.Floor(MathF.Min(sxa, sxb)) - 1);
+        int cx1 = Math.Min(w, (int)MathF.Floor(MathF.Max(sxa, sxb)) + 3);
+        int cy0 = Math.Max(0, (int)MathF.Floor(MathF.Min(sya, syb)) - 1);
+        int cy1 = Math.Min(h, (int)MathF.Floor(MathF.Max(sya, syb)) + 3);
+        return cx0 < cx1 && cy0 < cy1 && CountNonzero(nonzero, w, cx0, cy0, cx1, cy1) != 0;
     }
 
     /// <summary>Summed-area table of <c>src != 0</c>, <c>(w + 1)·(h + 1)</c> entries, into <paramref name="t"/>.</summary>
