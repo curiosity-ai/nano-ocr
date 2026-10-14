@@ -68,20 +68,57 @@ public sealed class GrayImage
         int w = Width, h = Height;
         GrayImage r = k == 2 ? new GrayImage(w, h) : new GrayImage(h, w);
         byte[] s = Pixels, d = r.Pixels;
-        for (int y = 0; y < h; y++)
+        if (k == 2)
         {
-            for (int x = 0; x < w; x++)
+            // Half a turn: the pixels in reverse order.
+            s.AsSpan(0, w * h).CopyTo(d);
+            d.AsSpan(0, w * h).Reverse();
+            return r;
+        }
+
+        // A quarter turn is a transpose with one axis flipped; 64×64 blocks keep both the rows
+        // read and the columns written in cache, and each output row of a block is written
+        // contiguously from a column of it.
+        QuarterTurn(s, d, w, h, k == 1);
+        return r;
+    }
+
+    private static unsafe void QuarterTurn(byte[] src, byte[] dst, int w, int h, bool clockwise)
+    {
+        const int B = 64;
+        fixed (byte* s = src)
+        fixed (byte* d = dst)
+        {
+            for (int y0 = 0; y0 < h; y0 += B)
             {
-                byte v = s[(y * w) + x];
-                switch (k)
+                int y1 = Math.Min(h, y0 + B);
+                for (int x0 = 0; x0 < w; x0 += B)
                 {
-                    case 1: d[(x * h) + (h - 1 - y)] = v; break; // clockwise: (x, y) -> (h-1-y, x)
-                    case 2: d[((h - 1 - y) * w) + (w - 1 - x)] = v; break;
-                    default: d[((w - 1 - x) * h) + y] = v; break; // counter-clockwise
+                    int x1 = Math.Min(w, x0 + B);
+                    for (int x = x0; x < x1; x++)
+                    {
+                        byte* from = s + (y0 * (long)w) + x;
+                        if (clockwise)
+                        {
+                            // (x, y) -> (h-1-y, x): row x, written right to left.
+                            byte* to = d + (x * (long)h) + h - 1 - y0;
+                            for (int y = y0; y < y1; y++, from += w)
+                            {
+                                *to-- = *from;
+                            }
+                        }
+                        else
+                        {
+                            // (x, y) -> (y, w-1-x): row w-1-x, left to right.
+                            byte* to = d + ((w - 1 - x) * (long)h) + y0;
+                            for (int y = y0; y < y1; y++, from += w)
+                            {
+                                *to++ = *from;
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        return r;
     }
 }

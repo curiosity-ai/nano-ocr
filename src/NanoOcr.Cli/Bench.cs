@@ -90,6 +90,7 @@ internal static class Bench
         }
 
         Stage("thumbnail", "(INTER_AREA to the 800-px deskew thumbnail)", () => CvResize.Resize(gray, (int)Math.Round(gray.Width * 800.0 / Math.Max(gray.Width, gray.Height)), (int)Math.Round(gray.Height * 800.0 / Math.Max(gray.Width, gray.Height)), Interpolation.Area));
+        Stage("turn", "(a quarter turn of the page, as an orientation fix does)", () => gray.RotateClockwise(1));
         Stage("skew", "(inside orient_ms)", () => NanoOcrEngine.EstimateSkew(gray));
         Stage("orient", "(the model, inside orient_ms)", () => engine.Orientation(gray));
         Stage("upright", "(orient_ms: model, skew, rotation)", () => engine.Upright(gray));
