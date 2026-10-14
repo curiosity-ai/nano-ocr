@@ -133,6 +133,13 @@ public sealed class Page
     [JsonPropertyName("skew")]
     public double Skew { get; set; }
 
+    /// <summary>
+    /// The page-type model's verdict on the page, when <see cref="EngineOptions.ClassifyPages"/> is
+    /// on; <see langword="null"/> otherwise.
+    /// </summary>
+    [JsonIgnore]
+    public PageTypePrediction? Type { get; set; }
+
     /// <summary>One line per detected line, in reading order.</summary>
     [JsonIgnore]
     public string Text => string.Join("\n", Lines.Select(l => l.Text));

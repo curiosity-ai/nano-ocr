@@ -1,3 +1,4 @@
+using NanoOcr.Imaging;
 using NanoOcr.Pipeline;
 using NanoOcr.Routing;
 using Xunit;
@@ -54,6 +55,81 @@ public class RoutingTests
         Assert.Equal(
             PageCategory.PrintedText,
             PageClassifier.Classify(Synthetic(20, 0.8, 12), PageClassifierOptions.Default with { PrintedConfidence = 0.7 }).Category);
+    }
+
+    /// <summary>A page-type verdict of <paramref name="p"/> for <paramref name="type"/>, the rest spread evenly.</summary>
+    private static PageTypePrediction Verdict(PageType type, float p)
+    {
+        var probs = new float[4];
+        Array.Fill(probs, (1 - p) / 3);
+        probs[(int)type] = p;
+        return PageTypePrediction.FromProbabilities(probs);
+    }
+
+    private static Page WithVerdict(Page page, PageType type, float p)
+    {
+        page.Type = Verdict(type, p);
+        return page;
+    }
+
+    [Fact]
+    public void ThePageTypeModelDecidesWhenThePageCarriesItsVerdict()
+    {
+        Assert.Equal(PageCategory.PrintedText, PageClassifier.Classify(WithVerdict(Synthetic(20, 0.97, 12), PageType.Printed, 0.9f)).Category);
+        Assert.Equal(PageCategory.TableOrComplex, PageClassifier.Classify(WithVerdict(Synthetic(20, 0.97, 12), PageType.Table, 0.9f)).Category);
+        Assert.Equal(PageCategory.Handwritten, PageClassifier.Classify(WithVerdict(Synthetic(20, 0.97, 12), PageType.Handwritten, 0.9f)).Category);
+
+        // What the reading cannot see: a photo, even one where the detector found no line at all.
+        PageClassification photo = PageClassifier.Classify(WithVerdict(new Page { Width = 1000, Height = 1300 }, PageType.Photo, 0.9f));
+        Assert.Equal(PageCategory.Photo, photo.Category);
+        Assert.StartsWith("page-type model: photo (0.90)", photo.Reason);
+
+        // An unsure model, and a page that looks printed but that NanoOCR read poorly, go to the fallback.
+        Assert.Equal(PageCategory.Mixed, PageClassifier.Classify(WithVerdict(Synthetic(20, 0.97, 12), PageType.Printed, 0.35f)).Category);
+        Assert.Equal(PageCategory.Mixed, PageClassifier.Classify(WithVerdict(Synthetic(20, 0.7, 12), PageType.Printed, 0.95f)).Category);
+
+        // A text layer was read exactly: the model may say which kind of print, not that it is not print.
+        Page digital = WithVerdict(Synthetic(20, 0.97, 12), PageType.Handwritten, 0.95f);
+        digital.Source = PageSources.Text;
+        Assert.Equal(PageCategory.PrintedText, PageClassifier.Classify(digital).Category);
+        digital.Type = Verdict(PageType.Table, 0.95f);
+        Assert.Equal(PageCategory.TableOrComplex, PageClassifier.Classify(digital).Category);
+
+        // The model's verdict can be ignored, and its confidence threshold is an option.
+        Page photoLike = WithVerdict(Synthetic(20, 0.97, 12), PageType.Photo, 0.9f);
+        Assert.Equal(PageCategory.PrintedText, PageClassifier.Classify(photoLike, PageClassifierOptions.Default with { UseModel = false }).Category);
+        Assert.Equal(PageCategory.Mixed, PageClassifier.Classify(photoLike, PageClassifierOptions.Default with { ModelConfidence = 0.95 }).Category);
+    }
+
+    [Fact]
+    public void ThePageTypeModelInputIsTheLongSideOnWhite()
+    {
+        // A black 100×50 page: scaled to 512×256 at the top left, white below.
+        float[] x = PageTypeModel.Input(new GrayImage(100, 50));
+        Assert.Equal(PageTypeModel.Side * PageTypeModel.Side, x.Length);
+        Assert.Equal(0f, x[0]);
+        Assert.Equal(0f, x[(255 * PageTypeModel.Side) + 511]);
+        Assert.Equal(1f, x[256 * PageTypeModel.Side]);
+        Assert.Equal(1f, x[^1]);
+    }
+
+    [Fact]
+    public void ThePageTypeModelClassifiesTheTestDocuments()
+    {
+        using var ocr = new NanoOCR(new NanoOcrOptions { ClassifyPages = true });
+        foreach (string name in new[] { "page_two_column.png", "page_math.png", "page_rotated.png", "scanned.pdf" })
+        {
+            OcrResult r = ocr.Predict(Doc(name)).First();
+            Assert.Equal(PageType.Printed, r.Page.Type!.Type);
+            Assert.Equal(PageCategory.PrintedText, PageClassifier.Classify(r).Category);
+            Assert.True(r.Page.Timings.ContainsKey("type_ms"));
+        }
+
+        // A text-layer page is classified too, from the render the layer is checked against.
+        Assert.NotNull(ocr.Predict(Doc("digital.pdf")).First().Page.Type);
+
+        // Off by default: no verdict, and the reading rules decide.
+        Assert.Null(Ocr.Value.Predict(Doc("page_math.png")).First().Page.Type);
     }
 
     [Fact]

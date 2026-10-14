@@ -16,6 +16,13 @@ public enum PageCategory
 
     /// <summary>The signals disagree or sit near a threshold; also pages with almost no text.</summary>
     Mixed,
+
+    /// <summary>
+    /// A camera photo — a scene, a sign, a receipt or a page photographed rather than scanned. Only
+    /// the page-type model calls a page this (<see cref="NanoOcrOptions.ClassifyPages"/>): the
+    /// reading alone cannot tell a photo with little text from an almost empty page.
+    /// </summary>
+    Photo,
 }
 
 /// <summary>
@@ -30,6 +37,7 @@ public enum PageCategory
 /// <param name="LineHeight">Median line height over the page height.</param>
 /// <param name="WideLineShare">Share of lines wider than <see cref="PageClassifierOptions.WideLine"/> of the page width.</param>
 /// <param name="TextLayer">The page was read from a PDF text layer (born digital).</param>
+/// <param name="Type">The page-type model's verdict, when the page was classified (<see cref="NanoOcrOptions.ClassifyPages"/>).</param>
 public sealed record PageSignals(
     int Lines,
     double Confidence,
@@ -38,7 +46,8 @@ public sealed record PageSignals(
     int Tables,
     double LineHeight,
     double WideLineShare,
-    bool TextLayer);
+    bool TextLayer,
+    PageTypePrediction? Type = null);
 
 /// <summary>A page's category, the signals behind it, and the rule that decided.</summary>
 /// <param name="Category">The category.</param>
@@ -81,13 +90,30 @@ public sealed record PageClassifierOptions
 
     /// <summary>…and at most this share of unread lines.</summary>
     public double PrintedUnreadShare { get; init; } = 0.35;
+
+    /// <summary>
+    /// Decide with the page-type model's verdict when the page carries one (the default); false
+    /// uses the reading-based rules alone.
+    /// </summary>
+    public bool UseModel { get; init; } = true;
+
+    /// <summary>
+    /// The page-type model must be at least this sure, or the page is <see cref="PageCategory.Mixed"/>.
+    /// Chosen on the held-out pages of <c>tools/pagetype</c>: 0.4 sends 83% of them to the engine of
+    /// their class with 6% left to the fallback; 0.6 sends 80% with 23% left over.
+    /// </summary>
+    public double ModelConfidence { get; init; } = 0.4;
 }
 
 /// <summary>
-/// Sorts a page into a <see cref="PageCategory"/> from its NanoOCR reading alone — no extra model,
-/// so classifying costs nothing beyond reading the page.
+/// Sorts a page into a <see cref="PageCategory"/>: from the page-type model's verdict when the page
+/// carries one (<see cref="NanoOcrOptions.ClassifyPages"/>), checked against the reading; from its
+/// NanoOCR reading alone otherwise, which costs nothing beyond reading the page.
 /// </summary>
 /// <remarks>
+/// <para>
+/// The reading-based rules, used without the model:
+/// </para>
 /// <para>
 /// The recognizer is trained on print, so handwriting comes back mostly unread or at low
 /// confidence; what tells it from a degraded print or a fax is its size — tall lines, and long
@@ -107,7 +133,13 @@ public sealed record PageClassifierOptions
 /// headers the order model reads as tables. No handwritten page is ever called printed — the
 /// error that would hand a page NanoOCR cannot read to NanoOCR. RVL-CDIP is 1990s fax-quality
 /// scans, the hard case; a born-digital page (a PDF text layer) is never handwritten.
-/// A trained classifier can replace this one in <see cref="PageRouter{TOutput}"/>.
+/// </para>
+/// <para>
+/// With the page-type model (<see cref="PageTypeModel"/>) on 610 held-out pages — RVL-CDIP scans,
+/// handwritten IAM pages and photos, none of them seen in training — 83% reach the engine of their
+/// class against 43% with the rules alone, every photo is recognised, and no handwritten page goes
+/// to NanoOCR. <c>tools/pagetype/README.md</c> has the breakdown. A classifier of your own can
+/// replace this one in <see cref="PageRouter{TOutput}"/>.
 /// </para>
 /// </remarks>
 public static class PageClassifier
@@ -128,6 +160,13 @@ public static class PageClassifier
         if (page.Source == PageSources.Error)
         {
             return new(PageCategory.Mixed, s, "the page failed: " + page.Note);
+        }
+
+        // A text layer was read exactly, whatever the page looks like: the model's word is taken on
+        // what kind of print it is, not on whether it is print at all.
+        if (o.UseModel && s.Type is { } type && (!s.TextLayer || type.Type is PageType.Printed or PageType.Table))
+        {
+            return FromModel(s, type, o);
         }
 
         if (s.Lines < o.MinLines)
@@ -155,6 +194,30 @@ public static class PageClassifier
         return new(PageCategory.PrintedText, s, "printed text read confidently");
     }
 
+    /// <summary>
+    /// The page-type model's verdict, checked against the reading where the reading knows better:
+    /// a page that looks printed but that NanoOCR read with low confidence is a degraded scan or an
+    /// unusual script, and goes to the fallback like any other page NanoOCR is unsure of.
+    /// </summary>
+    private static PageClassification FromModel(PageSignals s, PageTypePrediction type, PageClassifierOptions o)
+    {
+        string verdict = string.Create(System.Globalization.CultureInfo.InvariantCulture, $"page-type model: {type.Type.ToString().ToLowerInvariant()} ({type.Confidence:0.00})");
+        if (type.Confidence < o.ModelConfidence)
+        {
+            return new(PageCategory.Mixed, s, verdict + ", unsure");
+        }
+
+        return type.Type switch
+        {
+            PageType.Printed when s.Lines >= o.MinLines && (s.Confidence < o.PrintedConfidence || s.LowConfidenceShare >= o.PrintedUnreadShare)
+                => new(PageCategory.Mixed, s, verdict + ", but read with low confidence"),
+            PageType.Printed => new(PageCategory.PrintedText, s, verdict),
+            PageType.Table => new(PageCategory.TableOrComplex, s, verdict),
+            PageType.Handwritten => new(PageCategory.Handwritten, s, verdict),
+            _ => new(PageCategory.Photo, s, verdict),
+        };
+    }
+
     /// <summary>The signals <see cref="Classify(Page, PageClassifierOptions?)"/> decides on.</summary>
     /// <param name="page">The page.</param>
     /// <param name="options">Thresholds (the low-confidence and wide-line limits).</param>
@@ -166,7 +229,7 @@ public static class PageClassifier
         int n = lines.Count;
         if (n == 0)
         {
-            return new(0, 0, 0, 0, 0, 0, 0, textLayer);
+            return new(0, 0, 0, 0, 0, 0, 0, textLayer, page.Type);
         }
 
         double weighted = 0, weights = 0;
@@ -195,6 +258,7 @@ public static class PageClassifier
             tables,
             page.Height > 0 ? median / page.Height : 0,
             (double)wide / n,
-            textLayer);
+            textLayer,
+            page.Type);
     }
 }

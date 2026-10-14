@@ -33,6 +33,9 @@ from indra_ocr.order_post import line_features  # noqa: E402
 from indra_ocr.pipeline import orient_input  # noqa: E402
 from indra_ocr.rec_preproc import crop_line, pad_batch  # noqa: E402
 
+sys.path.insert(0, str(ROOT / "tools/pagetype"))
+from pagetype_input import model_input  # noqa: E402
+
 
 def all_outputs_session(path: Path) -> tuple[ort.InferenceSession, list[str], list[str]]:
     """A session whose outputs are every node output (in node order), and those names."""
@@ -114,6 +117,11 @@ def main() -> None:
 
     # Orientation classifier.
     dump(a.models, a.out, "orient", {"x": orient_input(page)[None, None]})
+
+    # Page-type classifier (not Indra's: NanoOCR's own, from tools/pagetype). It lives with the
+    # embedded models rather than in the Indra model folder.
+    pagetype = ROOT / "src/NanoOcr/Models/Assets"
+    dump(pagetype if (pagetype / "pagetype.onnx").exists() else a.models, a.out, "pagetype", {"x": model_input(page)})
 
     # Order model: the page's own line boxes and some texts.
     texts = [f"line {i} text." if i % 3 else "1. item" for i in range(len(boxes))]

@@ -20,3 +20,15 @@ into `NanoOcr.dll` as embedded resources, so the library needs no download at ru
 
 The weights are under Datalab's modified OpenRAIL-M license (`MODEL_LICENSE`), not the
 Apache-2.0 license of the code.
+
+## The page-type model
+
+`pagetype.onnx` is NanoOCR's own, not Indra's: MobileNetV3-Small (timm's
+`mobilenetv3_small_100.lamb_in1k`, Apache-2.0) fine-tuned on permissively licensed pages to tell
+printed, table, handwritten and photo pages apart, for `PageRouter`. It is trained and documented
+by [`tools/pagetype`](../../../../tools/pagetype/README.md), which lists every training source and
+its licence, and is distributed under the Apache-2.0 license of the code.
+
+| File | SHA-256 |
+| --- | --- |
+| pagetype.onnx | a3a54bc8d96301065c6517e8b1881f42a7eed9856347ac12ba305f6c2b60cd8f |

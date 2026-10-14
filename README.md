@@ -10,7 +10,8 @@ plus the PDF text layer, Chinese routing and the optional LaTeX math reader.
   interpreter and SIMD kernels (`System.Numerics.Tensors`, `Vector<T>`, AVX2 gathers); the image
   operations the pipeline needs are bit-exact ports of OpenCV's.
 - **Models embedded.** The `v3.1` model set (det, rec, rec_cjk, script, order, orient and the four
-  math models, 38 MB) is compiled into `NanoOcr.dll` — no download, no model folder.
+  math models, 38 MB) is compiled into `NanoOcr.dll` — no download, no model folder — along with
+  NanoOCR's own page-type model for [routing](#routing-pages) (MobileNetV3-Small, 6 MB).
 - **Validated layer by layer.** Every node output of every model matches ONNX Runtime, every image
   operation matches OpenCV byte for byte, and every pipeline stage matches the Python reference
   — down to identical markdown on the test corpus (see [Validation](#validation)).
@@ -87,6 +88,7 @@ foreach (var (path, pages, error) in ocr.PredictMany(files, cores: 8))
 | `Threads` | all cores | kernel threads for one page |
 | `ModelDir` | embedded | a folder laid out like the Hugging Face repository instead |
 | `KeepImages` | false | keep page images on the results (for `SaveToImg`) |
+| `ClassifyPages` | false | run the page-type model on every page (`Page.Type`), for [routing](#routing-pages); a few tens of ms a page |
 | `Fusion` | true | run the models with element-wise nodes fused into the convolutions; false runs the graphs as written (same results, slower) |
 | `Markdown` | `MarkdownOptions.Default` | the markdown flavour and the document-level passes (see [Markdown](#markdown)) |
 
@@ -160,18 +162,18 @@ done. A caller driving `NanoOcrEngine` or `DocumentConverter` directly calls
 ## Routing pages
 
 `PageRouter<TOutput>` reads each page with NanoOCR, sorts it into a `PageCategory` —
-`PrintedText`, `Handwritten`, `TableOrComplex` or `Mixed` — and hands it to the recognizer
-registered for that category, falling back to a default. It is generic on the output, so
-NanoOCR's own reading and another engine (PaddleOCR-VL, say) can share it through a conversion of
-their results:
+`PrintedText`, `TableOrComplex`, `Handwritten`, `Photo` or `Mixed` — and hands it to the
+recognizer registered for that category, falling back to a default. It is generic on the output,
+so NanoOCR's own reading and other engines (PaddleOCR-VL, Florence-2, …) can share it through a
+conversion of their results:
 
 ```csharp
-using var nano = new NanoOCR(new NanoOcrOptions { KeepImages = true });
+using var nano = new NanoOCR(new NanoOcrOptions { ClassifyPages = true, KeepImages = true });
 var router = new PageRouter<string>(nano)
     .When(PageCategory.PrintedText, page => page.Ocr.Markdown)          // NanoOCR's reading is the answer
+    .When(PageCategory.Photo, page => SceneText(page))                  // a scene-text reader
     .When(c => c.Signals.Tables > 2, page => VlMarkdown(page))          // predicates refine; first match wins
-    .When(PageCategory.Handwritten, page => VlMarkdown(page))
-    .Otherwise(page => VlMarkdown(page));                               // TableOrComplex, Mixed, …
+    .Otherwise(page => VlMarkdown(page));                               // tables, handwriting, Mixed
 
 foreach (RoutedResult<string> r in router.Route("scans/batch.pdf"))
     Console.WriteLine($"page {r.Page.PageIndex + 1}: {r.Page.Category} ({r.Page.Classification.Reason})");
@@ -183,8 +185,45 @@ classification. Asynchronous recognizers (`(page, ct) => ValueTask<T>`) go throu
 `When`/`Otherwise`, with `RouteAsync` returning an `IAsyncEnumerable`. Routes are tried in the
 order they were added; with no `Otherwise`, a page no route takes throws.
 
-The default classifier (`PageClassifier`) needs no model of its own — it decides from the reading
-NanoOCR already made, so classifying costs nothing more than reading the page (~0.1-0.2 s):
+### How a page is classified
+
+With `ClassifyPages` on, every page also goes through **the page-type model**: MobileNetV3-Small
+(ImageNet weights) fine-tuned to tell printed, table, handwritten and photo pages apart from the
+upright page image, 512×512 gray, a few tens of milliseconds a page, embedded like the Indra
+models. `PageClassifier` takes its verdict and checks it against NanoOCR's reading:
+
+| Model says | Category |
+| --- | --- |
+| anything, below 0.4 confidence | `Mixed` |
+| printed, but NanoOCR read it with low confidence (mean < 0.85, or ≥35% of lines unread) | `Mixed` — a degraded scan, an unusual script |
+| printed / table / handwritten / photo | `PrintedText` / `TableOrComplex` / `Handwritten` / `Photo` |
+| handwritten or photo, on a PDF text-layer page | the reading rules below: a text layer was read exactly |
+
+On 610 held-out pages — none of them in the training data: real 1990s office scans (RVL-CDIP),
+handwritten pages (IAM, RVL-CDIP) and photos (COCO-Text, Total-Text, CORD receipts) — with
+printed pages meant for NanoOCR, tables and handwriting for a VLM, and photos for a scene-text
+reader:
+
+| | reading rules alone | page-type model + reading check |
+| --- | --- | --- |
+| pages that reach the right engine | 42.5% | **83.1%** (threshold tuned on these pages) |
+| pages left to the fallback (`Mixed`) | 28.7% | 5.9% |
+| photos recognised | 0 of 240 | **240 of 240** |
+| handwritten pages sent to NanoOCR | 8 of 45 | **0 of 45** |
+
+Its weak spot is the oldest scans: of 200 fax-quality printed RVL-CDIP pages, 54% go to NanoOCR
+and 30% are taken for tables — sent to the VLM, which costs time rather than accuracy. Clean and
+born-digital pages are its home ground. The model costs 22-31 ms a page (one to four threads, the
+1700×2200 test page).
+
+The model, its data (all permissively licensed: DocLayNet, PubLayNet, FATURA2, NoTeS-Bank, GNHK,
+COCO-Text, Total-Text, CORD, and rendered office pages) and how to retrain it are in
+[`tools/pagetype`](https://github.com/curiosity-ai/nano-ocr/blob/main/tools/pagetype/README.md).
+
+### Without the model
+
+With `ClassifyPages` off (the default — plain OCR pays nothing for it), `PageClassifier` decides
+from the reading NanoOCR already made, at no cost beyond reading the page:
 
 | Category | Rule (every figure relative to the page, so independent of resolution) |
 | --- | --- |
@@ -195,13 +234,11 @@ NanoOCR already made, so classifying costs nothing more than reading the page (~
 | `Mixed` | printed, but mean confidence < 0.85 or ≥35% of lines unread |
 | `PrintedText` | everything else |
 
-It was calibrated on 160 RVL-CDIP pages and checked on 400 others (fax-quality 1990s scans, the
-hard case). On the 400 it finds 80% of the handwritten pages, and 56% of its handwriting calls are
-right (large-type adverts make up most of the rest); 83% of its printed calls are printed. **It
-never called a handwritten page printed** — the one error that would hand a page NanoOCR cannot
-read to NanoOCR. The thresholds are `PageClassifierOptions`; a trained classifier plugs in through
-`new PageRouter<T>(nano, result => …)`, and `nano-ocr classify` prints every signal per page for
-tuning on your own documents.
+The rules cannot recognise a photo, and they miss neat handwriting that the recognizer reads with
+fair confidence. The thresholds are `PageClassifierOptions` (`UseModel = false` forces the rules);
+a classifier of your own plugs in through `new PageRouter<T>(nano, result => …)`, and
+`nano-ocr classify` (`--no-model` for the rules alone) prints the model's probabilities and every
+signal per page for tuning on your own documents.
 
 ## Validation
 
@@ -212,7 +249,7 @@ produced on demand rather than committed, and the tests that need them skip when
 
 | Check | Scope | Result |
 | --- | --- | --- |
-| `LayerParityTests` | every node output of all 10 models (1,857 tensors) vs ONNX Runtime | all within tolerance (worst at 7% of it); CTC ids and lengths exact |
+| `LayerParityTests` | every node output of all 11 models (1,982 tensors, the page-type model's included) vs ONNX Runtime | all within tolerance (worst at 10% of it); CTC ids and lengths exact |
 | `ImagingParityTests` | resize (linear, area, fast area), warpAffine 8-bit and float, connected components, PNG gray decode, TIFF in 7 compressions vs OpenCV | **byte-exact**, 54 cases |
 | `PipelineParityTests` | orientation, deskewed page, boxes, per-line text/confidence/tokens, final pages; PDF renders and text layers; auto and OCR modes; math | upright pages byte-identical, boxes within 1e-4 px, every line and token identical, **markdown identical** on every page (in the reference style) |
 | `UnitTests` | the Python package's own unit tests, ported | pass |
@@ -257,11 +294,13 @@ src/NanoOcr/             the library (NuGet: NanoOCR)
   Imaging/               OpenCV ports, SkiaSharp IO, TIFF/CCITT
   Pdf/                   PDFium bindings
   Pipeline/              the Indra pipeline (one file per Python module)
-  Models/Assets/         the embedded models (OpenRAIL-M, see MODEL_LICENSE)
+  Models/Assets/         the embedded models (Indra's under OpenRAIL-M, see MODEL_LICENSE; pagetype.onnx Apache-2.0)
+  Routing/               PageClassifier and PageRouter
   NanoOCR.cs             the PaddleOCR-style API
 src/NanoOcr.Cli/         nano-ocr (NuGet: NanoOCR.Cli, a .NET tool)
 tests/NanoOcr.Tests/     parity and unit tests
 tools/reference/         Python scripts that produce the reference fixtures
+tools/pagetype/          training and evaluation of the page-type model
 .devops/                 the Azure DevOps pipeline that publishes the packages
 .reference/              the original Python package, unchanged
 ```

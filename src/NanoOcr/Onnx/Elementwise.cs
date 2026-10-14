@@ -349,6 +349,17 @@ internal static partial class Operators
         return result;
     }
 
+    /// <summary>ONNX HardSigmoid: <c>clamp(alpha·x + beta, 0, 1)</c>, the squeeze-excite gate of MobileNetV3.</summary>
+    internal static Tensor HardSigmoid(Tensor a, float alpha, float beta)
+    {
+        Tensor result = Tensor.Float((int[])a.Shape.Clone());
+        Span<float> z = result.Floats;
+        TensorPrimitives.Multiply(a.Floats, alpha, z);
+        TensorPrimitives.Add(z, beta, z);
+        TensorPrimitives.Clamp(z, 0f, 1f, z);
+        return result;
+    }
+
     internal static Tensor Cast(Tensor a, int to)
     {
         ElementType target = OnnxModel.ElementTypeOf(to);

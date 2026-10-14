@@ -14,7 +14,7 @@ public class LayerParityTests(ITestOutputHelper output)
 {
     public static TheoryData<string> Models => new()
     {
-        "det", "rec", "rec_cjk", "script", "mathcls", "orient", "order", "math_enc", "math_dec_init", "math_dec_step",
+        "det", "rec", "rec_cjk", "script", "mathcls", "orient", "order", "math_enc", "math_dec_init", "math_dec_step", "pagetype",
     };
 
     [Theory]
