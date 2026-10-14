@@ -1,8 +1,8 @@
 # Reference fixtures
 
-Python scripts that run the **original** pipeline (in `.reference/`) and the libraries it is
+Python scripts that run the **original** pipeline (`pip install indra-ocr==0.3.1`, from https://github.com/datalab-to/indra) and the libraries it is
 built on, and dump what they compute, so the C# port can be checked against them. They need
-`numpy onnx onnxruntime opencv-python-headless pypdfium2 pillow reportlab pikepdf` and the
+`indra-ocr==0.3.1 numpy onnx onnxruntime opencv-python-headless pypdfium2 pillow reportlab pikepdf` and the
 model folder (`huggingface-cli download datalab-to/indra-ocr --revision v3.1 --local-dir models`).
 
 | Script | Writes | Checked by |

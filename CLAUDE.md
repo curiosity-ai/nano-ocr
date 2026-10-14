@@ -1,7 +1,7 @@
 # NanoOCR — Pure C# Port of Indra OCR
 
 This repository is **NanoOCR, a pure C# re-implementation of Indra OCR** (the Python package `indra-ocr`
-0.3.1, Datalab). The original Python sources live unchanged in [`.reference/`](.reference/) and
+0.3.1, Datalab). The original Python sources live in the upstream repository, <https://github.com/datalab-to/indra> (`pip install indra-ocr==0.3.1`), and
 are the **normative specification: when C# and Python disagree, Python is right.** The original
 PyPI publish workflow is disabled (`.github/workflows/publish.yml.disabled`); do not re-enable it.
 The C# packages (`NanoOCR`, `NanoOCR.Cli`) are published to NuGet by Azure DevOps,
@@ -91,7 +91,7 @@ helpers (`encode_targets`, vocabulary builders, label canonicalization).
 
 ## The page-type model
 
-`pagetype.onnx` is the one model that is NanoOCR's rather than Indra's, so `.reference/` says
+`pagetype.onnx` is the one model that is NanoOCR's rather than Indra's, so the Python package says
 nothing about it: `tools/pagetype/` is its specification. Its input is
 `tools/pagetype/pagetype_input.py`, and `PageTypeModel.Input` must produce the same floats — the
 resize is OpenCV's INTER_AREA, which `CvResize` reproduces to the byte. Every training source is
