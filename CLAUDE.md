@@ -4,6 +4,11 @@ This repository is **NanoOCR, a pure C# re-implementation of Indra OCR** (the Py
 0.3.1, Datalab). The original Python sources live unchanged in [`.reference/`](.reference/) and
 are the **normative specification: when C# and Python disagree, Python is right.** The original
 PyPI publish workflow is disabled (`.github/workflows/publish.yml.disabled`); do not re-enable it.
+The C# packages (`NanoOCR`, `NanoOCR.Cli`) are published to NuGet by Azure DevOps,
+[`.devops/azure-pipelines.yml`](.devops/azure-pipelines.yml), on every push to `main` — the same
+setup as `curiosity-ai/sentence-transformers-sharp`: one CalVer version (`yy.M.<buildId>`) stamped
+on both packages of a run via `/p:Version`, the repository README as the package README (so its
+links are absolute GitHub URLs).
 
 The port owns its tensor math, ONNX graph interpreter, image operations and PDF text layer. **It
 does not use ONNX Runtime, OpenCV, or any other inference or vision library.** SkiaSharp decodes

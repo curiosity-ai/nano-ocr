@@ -1,0 +1,82 @@
+# Publishes NanoOCR to nuget.org on every push to main, the same way sentence-transformers-sharp
+# publishes its packages: one CalVer version (yy.M.<buildId>) stamped on every package of a run,
+# packages produced by building with GeneratePackageOnBuild, pushed through the
+# 'nuget-curiosity-org' service connection.
+#
+# Two packages:
+#   NanoOCR      src/NanoOcr       the library, models embedded
+#   NanoOCR.Cli  src/NanoOcr.Cli   the nano-ocr .NET tool (depends on NanoOCR at the same version)
+
+variables:
+  projectLibrary:     './src/NanoOcr/NanoOcr.csproj'
+  projectCli:         './src/NanoOcr.Cli/NanoOcr.Cli.csproj'
+  solution:           './NanoOcr.slnx'
+  buildConfiguration: 'Release'
+  targetVersion:      yy.M.$(build.buildId)
+
+pool:
+  vmImage: 'windows-latest'
+
+trigger:
+- main
+
+steps:
+- checkout: self
+  fetchDepth: 10
+
+- task: PowerShell@2
+  displayName: 'Create CalVer Version'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $dottedDate = (Get-Date).ToString("yy.M")
+      $buildID = $($env:BUILD_BUILDID)
+      $modBuildID = [int]$buildID % 65536  # ensure fits in int16
+      $newTargetVersion = "$dottedDate.$modBuildID"
+      Write-Host "##vso[task.setvariable variable=targetVersion;]$newTargetVersion"
+      Write-Host "Updated targetVersion to '$newTargetVersion'"
+
+- task: UseDotNet@2
+  displayName: 'Use .NET 10.0 SDK'
+  inputs:
+    packageType: sdk
+    version: 10.x
+    includePreviewVersions: false
+    installationPath: $(Agent.ToolsDirectory)/dotnet
+
+- task: DotNetCoreCLI@2
+  displayName: 'restore nuget'
+  inputs:
+    command: 'restore'
+    projects: '$(solution)'
+
+# The parity tests that need generated fixtures skip when they are absent; the rest
+# (unit tests, markdown, fused-vs-unfused graphs) run on the embedded models.
+- task: DotNetCoreCLI@2
+  displayName: 'test'
+  inputs:
+    command: 'test'
+    projects: './tests/NanoOcr.Tests/NanoOcr.Tests.csproj'
+    arguments: '-c $(buildConfiguration)'
+
+- task: DotNetCoreCLI@2
+  displayName: 'build NanoOCR'
+  inputs:
+    command: 'build'
+    projects: '$(projectLibrary)'
+    arguments: '-c $(buildConfiguration) /p:Version=$(targetVersion) /p:GeneratePackageOnBuild=true'
+
+- task: DotNetCoreCLI@2
+  displayName: 'build NanoOCR.Cli'
+  inputs:
+    command: 'build'
+    projects: '$(projectCli)'
+    arguments: '-c $(buildConfiguration) /p:Version=$(targetVersion) /p:GeneratePackageOnBuild=true'
+
+- task: NuGetCommand@2
+  displayName: 'push all nuget packages'
+  inputs:
+    command: 'push'
+    packagesToPush: '**/*.nupkg'
+    nuGetFeedType: 'external'
+    publishFeedCredentials: 'nuget-curiosity-org'
