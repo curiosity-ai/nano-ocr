@@ -269,6 +269,33 @@ internal static partial class Operators
     private static void PointwiseBatched(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
     {
         int t = p.H * p.W, c = p.C, m = p.M, cols = n * t;
+        if (Gemm.Wide)
+        {
+            // The product reads the items in place and writes them in place; then bias and
+            // epilogue per output row, the same Σ + bias as the packed path below.
+            Gemm.MultiplyBatched(m, t, n, c, weight, c, input, (long)c * t, output, (long)m * t);
+            Parallelism.For(n, (long)m * cols, (b0, b1) =>
+            {
+                for (int b = b0; b < b1; b++)
+                {
+                    for (int r = 0; r < m; r++)
+                    {
+                        Span<float> dst = output.AsSpan(((b * m) + r) * t, t);
+                        if (bias is not null)
+                        {
+                            TensorPrimitives.Add(dst, bias[r], dst);
+                        }
+
+                        if (!epilogue.IsEmpty)
+                        {
+                            epilogue.Apply(dst, ((b * m) + r) * t);
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
         float[] packed = System.Buffers.ArrayPool<float>.Shared.Rent(c * cols);
         float[] product = System.Buffers.ArrayPool<float>.Shared.Rent(m * cols);
         try

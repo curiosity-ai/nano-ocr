@@ -66,19 +66,64 @@ public static unsafe class Gemm
         fixed (float* pb = b)
         fixed (float* pc = c)
         {
-            long work = (long)m * n * k;
-            int workers = Parallelism.Workers;
-            if (workers <= 1 || work < 1 << 20)
-            {
-                Region(pa, lda, pb, ldb, pc, ldc, 0, m, 0, n, k, accumulate);
-                return;
-            }
-
-            RunParallel((nint)pa, lda, (nint)pb, ldb, (nint)pc, ldc, m, n, k, accumulate, workers);
+            Run(pa, lda, pb, ldb, pc, ldc, m, n, k, accumulate, Segments.None);
         }
     }
 
-    private static void RunParallel(nint pa, int lda, nint pb, int ldb, nint pc, int ldc, int m, int n, int k, bool accumulate, int workers)
+    /// <summary>
+    /// <c>C_i[M, T] = A[M, K] · B_i[K, T]</c> for <paramref name="batch"/> items laid out one after
+    /// another (<c>B_i</c> at <c>i·bStride</c>, <c>C_i</c> at <c>i·cStride</c>, rows <c>T</c> apart):
+    /// one product over <c>batch·T</c> columns whose packing reads the items in place, so a 1×1
+    /// convolution over a batch of short sequences needs no copy into <c>[K, batch·T]</c> and back.
+    /// Each output is the same in-order FMA chain as <see cref="Multiply"/> computes. Requires the
+    /// 512-bit kernels (<see cref="Wide"/>).
+    /// </summary>
+    public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride)
+    {
+        if (!Wide)
+        {
+            throw new NotSupportedException("MultiplyBatched needs the 512-bit kernels.");
+        }
+
+        if (m == 0 || t == 0 || batch == 0)
+        {
+            return;
+        }
+
+        fixed (float* pa = a)
+        fixed (float* pb = b)
+        fixed (float* pc = c)
+        {
+            Run(pa, lda, pb, t, pc, t, m, t * batch, k, false, new Segments(t, bStride, cStride));
+        }
+    }
+
+    /// <summary>How logical columns map to memory: <see cref="Len"/> columns per item, items <see cref="BStride"/> / <see cref="CStride"/> apart.</summary>
+    private readonly record struct Segments(int Len, long BStride, long CStride)
+    {
+        public static readonly Segments None = new(int.MaxValue, 0, 0);
+
+        public bool IsNone => Len == int.MaxValue;
+
+        public long B(int j) => ((j / Len) * BStride) + (j % Len);
+
+        public long C(int j) => ((j / Len) * CStride) + (j % Len);
+    }
+
+    private static void Run(float* pa, int lda, float* pb, int ldb, float* pc, int ldc, int m, int n, int k, bool accumulate, Segments seg)
+    {
+        long work = (long)m * n * k;
+        int workers = Parallelism.Workers;
+        if (workers <= 1 || work < 1 << 20)
+        {
+            Region(pa, lda, pb, ldb, pc, ldc, 0, m, 0, n, k, accumulate, seg);
+            return;
+        }
+
+        RunParallel((nint)pa, lda, (nint)pb, ldb, (nint)pc, ldc, m, n, k, accumulate, workers, seg);
+    }
+
+    private static void RunParallel(nint pa, int lda, nint pb, int ldb, nint pc, int ldc, int m, int n, int k, bool accumulate, int workers, Segments seg)
     {
         if (n >= m || m < 8)
         {
@@ -91,7 +136,7 @@ public static unsafe class Gemm
             {
                 int j0 = ci * size;
                 int j1 = Math.Min(n, j0 + size);
-                Region((float*)pa, lda, (float*)pb, ldb, (float*)pc, ldc, 0, m, j0, j1, k, accumulate);
+                Region((float*)pa, lda, (float*)pb, ldb, (float*)pc, ldc, 0, m, j0, j1, k, accumulate, seg);
             });
         }
         else
@@ -104,7 +149,7 @@ public static unsafe class Gemm
             {
                 int i0 = ci * size;
                 int i1 = Math.Min(m, i0 + size);
-                Region((float*)pa, lda, (float*)pb, ldb, (float*)pc, ldc, i0, i1, 0, n, k, accumulate);
+                Region((float*)pa, lda, (float*)pb, ldb, (float*)pc, ldc, i0, i1, 0, n, k, accumulate, seg);
             });
         }
     }
@@ -117,11 +162,11 @@ public static unsafe class Gemm
     /// Six rows at a time hold twelve accumulators in registers. Every output element is still a
     /// single fused multiply-add chain over k in order, so the packing does not change results.
     /// </remarks>
-    private static void Region(float* a, int lda, float* b, int ldb, float* c, int ldc, int i0, int i1, int j0, int j1, int k, bool accumulate)
+    private static void Region(float* a, int lda, float* b, int ldb, float* c, int ldc, int i0, int i1, int j0, int j1, int k, bool accumulate, Segments seg)
     {
-        if (Wide && i1 - i0 >= 4)
+        if (Wide && (i1 - i0 >= 4 || !seg.IsNone))
         {
-            Region512(a, lda, b, ldb, c, ldc, i0, i1, j0, j1, k, accumulate);
+            Region512(a, lda, b, ldb, c, ldc, i0, i1, j0, j1, k, accumulate, seg);
             return;
         }
 
@@ -339,7 +384,7 @@ public static unsafe class Gemm
     /// models use (multiples of 8, and 1678 = 8·209 + 6) rarely leave a row to the 1-row kernel.
     /// Every output is still one in-order FMA chain over k, so the results equal the 256-bit path's.
     /// </summary>
-    private static void Region512(float* a, int lda, float* b, int ldb, float* c, int ldc, int i0, int i1, int j0, int j1, int k, bool accumulate)
+    private static void Region512(float* a, int lda, float* b, int ldb, float* c, int ldc, int i0, int i1, int j0, int j1, int k, bool accumulate, Segments seg)
     {
         const int nr = 32;
         float[] buffer = System.Buffers.ArrayPool<float>.Shared.Rent(KBlock * (NBlock + nr));
@@ -355,40 +400,52 @@ public static unsafe class Gemm
                     {
                         int kc = Math.Min(KBlock, k - kb);
                         bool add = accumulate || kb > 0;
-                        Pack(b + (kb * (long)ldb), ldb, jb, je, kc, nr, packed);
+                        if (seg.IsNone)
+                        {
+                            Pack(b + (kb * (long)ldb), ldb, jb, je, kc, nr, packed);
+                        }
+                        else
+                        {
+                            PackSegments(b + (kb * (long)ldb), ldb, jb, je, kc, nr, packed, seg);
+                        }
+
                         for (int s = 0; s < strips; s++)
                         {
                             int js = jb + (s * nr);
                             int width = Math.Min(nr, je - js);
                             float* strip = packed + ((long)s * kc * nr);
                             int i = i0;
-                            if (width == nr)
+
+                            // A strip that straddles two items cannot be stored with one row stride.
+                            bool split = !seg.IsNone && js / seg.Len != (js + width - 1) / seg.Len;
+                            float* cs = c + (seg.IsNone ? js : seg.C(js));
+                            if (width == nr && !split)
                             {
                                 for (; i + 8 <= i1; i += 8)
                                 {
-                                    K512x8(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, add);
+                                    K512x8(a + (i * (long)lda) + kb, lda, strip, kc, cs + (i * (long)ldc), ldc, add);
                                 }
 
                                 if (i + 4 <= i1)
                                 {
-                                    K512x4(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, add);
+                                    K512x4(a + (i * (long)lda) + kb, lda, strip, kc, cs + (i * (long)ldc), ldc, add);
                                     i += 4;
                                 }
 
                                 if (i + 2 <= i1)
                                 {
-                                    K512x2(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, add);
+                                    K512x2(a + (i * (long)lda) + kb, lda, strip, kc, cs + (i * (long)ldc), ldc, add);
                                     i += 2;
                                 }
 
                                 if (i < i1)
                                 {
-                                    K512x1(a + (i * (long)lda) + kb, strip, kc, c + (i * (long)ldc) + js, add);
+                                    K512x1(a + (i * (long)lda) + kb, strip, kc, cs + (i * (long)ldc), add);
                                 }
                             }
                             else
                             {
-                                Edge512(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc) + js, ldc, i1 - i, width, add);
+                                Edge512(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc), ldc, i1 - i, js, width, add, seg);
                             }
                         }
                     }
@@ -401,12 +458,21 @@ public static unsafe class Gemm
         }
     }
 
-    /// <summary>A strip narrower than 32 columns: through a scratch tile, eight rows at a time.</summary>
+    /// <summary>
+    /// A strip narrower than 32 columns, or one split between two items: through a scratch tile,
+    /// eight rows at a time; <paramref name="c"/> points at column 0 of the strip's first row.
+    /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void Edge512(float* a, int lda, float* bp, int kc, float* c, int ldc, int rows, int width, bool add)
+    private static void Edge512(float* a, int lda, float* bp, int kc, float* c, int ldc, int rows, int js, int width, bool add, Segments seg)
     {
         const int nr = 32;
         float* t = stackalloc float[8 * nr];
+        long* col = stackalloc long[nr];
+        for (int q = 0; q < width; q++)
+        {
+            col[q] = seg.IsNone ? js + q : seg.C(js + q);
+        }
+
         for (int r0 = 0; r0 < rows; r0 += 8)
         {
             int rr = Math.Min(8, rows - r0);
@@ -414,7 +480,7 @@ public static unsafe class Gemm
             {
                 for (int q = 0; q < nr; q++)
                 {
-                    t[(r * nr) + q] = add && q < width ? c[((r0 + r) * (long)ldc) + q] : 0f;
+                    t[(r * nr) + q] = add && q < width ? c[((r0 + r) * (long)ldc) + col[q]] : 0f;
                 }
             }
 
@@ -447,8 +513,43 @@ public static unsafe class Gemm
             {
                 for (int q = 0; q < width; q++)
                 {
-                    c[((r0 + r) * (long)ldc) + q] = t[(r * nr) + q];
+                    c[((r0 + r) * (long)ldc) + col[q]] = t[(r * nr) + q];
                 }
+            }
+        }
+    }
+
+    /// <summary><see cref="Pack"/> for columns laid out in items (<see cref="Segments"/>).</summary>
+    private static void PackSegments(float* b, int ldb, int jb, int je, int kc, int nr, float* packed, Segments seg)
+    {
+        int strips = (je - jb + nr - 1) / nr;
+        for (int s = 0; s < strips; s++)
+        {
+            int js = jb + (s * nr);
+            int width = Math.Min(nr, je - js);
+            float* dst = packed + ((long)s * kc * nr);
+            for (int q0 = 0; q0 < nr;)
+            {
+                if (q0 >= width)
+                {
+                    for (int p = 0; p < kc; p++)
+                    {
+                        new Span<float>(dst + (p * nr) + q0, nr - q0).Clear();
+                    }
+
+                    break;
+                }
+
+                // A run of columns inside one item is contiguous in every row.
+                int j = js + q0;
+                int run = Math.Min(width - q0, seg.Len - (j % seg.Len));
+                float* src = b + seg.B(j);
+                for (int p = 0; p < kc; p++)
+                {
+                    Buffer.MemoryCopy(src + (p * (long)ldb), dst + (p * nr) + q0, run * sizeof(float), run * sizeof(float));
+                }
+
+                q0 += run;
             }
         }
     }
