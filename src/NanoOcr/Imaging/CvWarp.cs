@@ -165,8 +165,78 @@ public static class CvWarp
     {
         float mx = (y * m[1]) + m[2];
         float my = (y * m[4]) + m[5];
-        int x = Avx2.IsSupported && Fma.IsSupported ? GatherRow(src, w, h, m, mx, my, row) : 0;
-        for (; x < w; x++)
+        WarpRowRange(src, w, h, m, mx, my, row, 0, w);
+    }
+
+    /// <summary>
+    /// <see cref="WarpConstantZeroRow"/> that skips what it can prove is zero: the output is cut
+    /// into 32-pixel chunks, and a chunk whose bilinear taps all fall on zero source pixels (or
+    /// outside the image) is written as zeros without being computed — exactly what the full
+    /// computation gives, since every tap term is <c>0</c> then. <paramref name="nonzero"/> is the
+    /// summed-area table of <c>src != 0</c> (<see cref="NonzeroTable"/>). Returns whether any
+    /// chunk was computed; when none was, the row is all zeros.
+    /// </summary>
+    internal static bool WarpConstantZeroRowSparse(float[] src, int w, int h, float[] m, int y, Span<float> row, int[] nonzero)
+    {
+        const int Chunk = 32;
+        float mx = (y * m[1]) + m[2];
+        float my = (y * m[4]) + m[5];
+        bool any = false;
+        for (int x0 = 0; x0 < w; x0 += Chunk)
+        {
+            int x1 = Math.Min(w, x0 + Chunk);
+
+            // The map is affine and the fused step is monotonic in x, so the chunk's source
+            // positions lie between its two ends; one pixel of margin covers the second tap.
+            float sxa = MathF.FusedMultiplyAdd(m[0], x0, mx), sxb = MathF.FusedMultiplyAdd(m[0], x1 - 1, mx);
+            float sya = MathF.FusedMultiplyAdd(m[3], x0, my), syb = MathF.FusedMultiplyAdd(m[3], x1 - 1, my);
+            int cx0 = Math.Max(0, (int)MathF.Floor(MathF.Min(sxa, sxb)) - 1);
+            int cx1 = Math.Min(w, (int)MathF.Floor(MathF.Max(sxa, sxb)) + 3);
+            int cy0 = Math.Max(0, (int)MathF.Floor(MathF.Min(sya, syb)) - 1);
+            int cy1 = Math.Min(h, (int)MathF.Floor(MathF.Max(sya, syb)) + 3);
+            if (cx0 >= cx1 || cy0 >= cy1 || CountNonzero(nonzero, w, cx0, cy0, cx1, cy1) == 0)
+            {
+                row.Slice(x0, x1 - x0).Clear();
+                continue;
+            }
+
+            any = true;
+            WarpRowRange(src, w, h, m, mx, my, row, x0, x1);
+        }
+
+        return any;
+    }
+
+    /// <summary>Summed-area table of <c>src != 0</c>, <c>(w + 1)·(h + 1)</c> entries.</summary>
+    internal static int[] NonzeroTable(ReadOnlySpan<float> src, int w, int h)
+    {
+        var t = new int[(w + 1) * (h + 1)];
+        for (int y = 0; y < h; y++)
+        {
+            int run = 0;
+            ReadOnlySpan<float> r = src.Slice(y * w, w);
+            int o = (y + 1) * (w + 1), up = y * (w + 1);
+            for (int x = 0; x < w; x++)
+            {
+                run += r[x] != 0f ? 1 : 0;
+                t[o + x + 1] = t[up + x + 1] + run;
+            }
+        }
+
+        return t;
+    }
+
+    private static int CountNonzero(int[] t, int w, int x0, int y0, int x1, int y1)
+    {
+        int s = w + 1;
+        return t[(y1 * s) + x1] - t[(y0 * s) + x1] - t[(y1 * s) + x0] + t[(y0 * s) + x0];
+    }
+
+    /// <summary>Columns <c>[x0, x1)</c> of one warped row.</summary>
+    private static void WarpRowRange(float[] src, int w, int h, float[] m, float mx, float my, Span<float> row, int x0, int x1)
+    {
+        int x = Avx2.IsSupported && Fma.IsSupported ? GatherRow(src, w, h, m, mx, my, row, x0, x1) : x0;
+        for (; x < x1; x++)
         {
             float sx = MathF.FusedMultiplyAdd(m[0], x, mx);
             float sy = MathF.FusedMultiplyAdd(m[3], x, my);
@@ -210,7 +280,7 @@ public static class CvWarp
     /// lie inside the image; returns the first column it did not do. The arithmetic per lane is the
     /// scalar path's (the same fused multiply-adds), so the output is identical.
     /// </summary>
-    private static unsafe int GatherRow(float[] src, int w, int h, float[] m, float mx, float my, Span<float> row)
+    private static unsafe int GatherRow(float[] src, int w, int h, float[] m, float mx, float my, Span<float> row, int x0, int x1)
     {
         var m0 = Vector256.Create(m[0]);
         var m3 = Vector256.Create(m[3]);
@@ -220,11 +290,11 @@ public static class CvWarp
         var wv = Vector256.Create(w);
         var limitX = Vector256.Create(w - 1);
         var limitY = Vector256.Create(h - 1);
-        int x = 0;
+        int x = x0;
         fixed (float* s = src)
         fixed (float* d = row)
         {
-            for (; x + 8 <= w; x += 8)
+            for (; x + 8 <= x1; x += 8)
             {
                 Vector256<float> xs = Vector256.Create((float)x) + lanes;
                 Vector256<float> sx = Fma.MultiplyAdd(m0, xs, vmx);

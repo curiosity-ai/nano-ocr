@@ -1,3 +1,6 @@
+using System.Numerics;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using NanoOcr.Core;
 
 namespace NanoOcr.Imaging;
@@ -253,52 +256,149 @@ public static class CvResize
 
         tabofs[dst.Height] = ytab.Length;
         int sw = src.Width, dw = dst.Width;
+
+        // The horizontal table as a [taps, dw] grid: output column dx sums its entries in table
+        // order; columns with fewer entries are padded with weight-0 taps at the end, which add
+        // exactly +0 to a non-negative sum. One output per lane then accumulates in a register
+        // (the original accumulated through memory, entry by entry).
+        int taps = 1;
+        for (int k = 0, run = 0; k < xtab.Length; k++)
+        {
+            run = k > 0 && xtab[k].Di == xtab[k - 1].Di ? run + 1 : 1;
+            taps = Math.Max(taps, run);
+        }
+
+        var xi = new int[taps * dw];
+        var xa = new float[taps * dw];
+        for (int k = 0, slot = 0; k < xtab.Length; k++)
+        {
+            slot = k > 0 && xtab[k].Di == xtab[k - 1].Di ? slot + 1 : 0;
+            xi[(slot * dw) + xtab[k].Di] = xtab[k].Si;
+            xa[(slot * dw) + xtab[k].Di] = xtab[k].Alpha;
+        }
+
         byte[] s = src.Pixels, d = dst.Pixels;
         Parallelism.For(dst.Height, (long)src.Width * src.Height * 2, (y0, y1) =>
         {
-            var buf = new float[dw];
-            var sum = new float[dw];
+            float[] rowF = System.Buffers.ArrayPool<float>.Shared.Rent(sw);
+            float[] buf = System.Buffers.ArrayPool<float>.Shared.Rent(dw);
+            float[] sum = System.Buffers.ArrayPool<float>.Shared.Rent(dw);
+            Array.Clear(sum, 0, dw); // the first source row of a chunk accumulates into it
             int jStart = tabofs[y0], jEnd = tabofs[y1];
             int prevDy = ytab[jStart].Di;
             for (int j = jStart; j < jEnd; j++)
             {
                 float beta = ytab[j].Alpha;
                 int dy = ytab[j].Di;
-                ReadOnlySpan<byte> row = s.AsSpan(ytab[j].Si * sw, sw);
-                Array.Clear(buf);
-                foreach (Decimate t in xtab)
-                {
-                    buf[t.Di] += row[t.Si] * t.Alpha;
-                }
-
+                Widen(s.AsSpan(ytab[j].Si * sw, sw), rowF);
+                AreaRow(rowF, xi, xa, taps, dw, buf);
                 if (dy != prevDy)
                 {
-                    Store(sum, d.AsSpan(prevDy * dw, dw));
-                    for (int x = 0; x < dw; x++)
-                    {
-                        sum[x] = beta * buf[x];
-                    }
-
+                    StoreBytes(sum.AsSpan(0, dw), d.AsSpan(prevDy * dw, dw));
+                    ScaleInto(buf, beta, sum, dw, accumulate: false);
                     prevDy = dy;
                 }
                 else
                 {
-                    for (int x = 0; x < dw; x++)
-                    {
-                        sum[x] += beta * buf[x];
-                    }
+                    ScaleInto(buf, beta, sum, dw, accumulate: true);
                 }
             }
 
-            Store(sum, d.AsSpan(prevDy * dw, dw));
+            StoreBytes(sum.AsSpan(0, dw), d.AsSpan(prevDy * dw, dw));
+            System.Buffers.ArrayPool<float>.Shared.Return(rowF);
+            System.Buffers.ArrayPool<float>.Shared.Return(buf);
+            System.Buffers.ArrayPool<float>.Shared.Return(sum);
         });
+    }
 
-        static void Store(float[] sum, Span<byte> dst)
+    /// <summary>Bytes to floats (exact).</summary>
+    private static void Widen(ReadOnlySpan<byte> row, float[] dst)
+    {
+        int x = 0;
+        if (Vector128.IsHardwareAccelerated)
         {
-            for (int x = 0; x < dst.Length; x++)
+            for (; x + 16 <= row.Length; x += 16)
             {
-                dst[x] = SaturateByte(sum[x]);
+                Vector128<byte> v = Vector128.Create(row.Slice(x, 16));
+                (Vector128<ushort> lo, Vector128<ushort> hi) = Vector128.Widen(v);
+                (Vector128<uint> a, Vector128<uint> b) = Vector128.Widen(lo);
+                (Vector128<uint> c, Vector128<uint> e) = Vector128.Widen(hi);
+                Vector128.ConvertToSingle(a.AsInt32()).CopyTo(dst, x);
+                Vector128.ConvertToSingle(b.AsInt32()).CopyTo(dst, x + 4);
+                Vector128.ConvertToSingle(c.AsInt32()).CopyTo(dst, x + 8);
+                Vector128.ConvertToSingle(e.AsInt32()).CopyTo(dst, x + 12);
             }
+        }
+
+        for (; x < row.Length; x++)
+        {
+            dst[x] = row[x];
+        }
+    }
+
+    /// <summary>One source row through the horizontal area table: <c>buf[dx] = Σ row[si]·α</c>, in table order.</summary>
+    private static unsafe void AreaRow(float[] row, int[] xi, float[] xa, int taps, int dw, float[] buf)
+    {
+        int dx = 0;
+        fixed (float* r = row)
+        fixed (int* pi = xi)
+        fixed (float* pa = xa)
+        fixed (float* b = buf)
+        {
+            if (Avx2.IsSupported)
+            {
+                for (; dx + 8 <= dw; dx += 8)
+                {
+                    Vector256<float> acc = Vector256<float>.Zero;
+                    for (int k = 0; k < taps; k++)
+                    {
+                        Vector256<int> idx = Avx.LoadVector256(pi + (k * dw) + dx);
+                        Vector256<float> p = Avx2.GatherVector256(r, idx, 4);
+                        acc = Avx.Add(acc, Avx.Multiply(p, Avx.LoadVector256(pa + (k * dw) + dx)));
+                    }
+
+                    Avx.Store(b + dx, acc);
+                }
+            }
+
+            for (; dx < dw; dx++)
+            {
+                float acc = 0f;
+                for (int k = 0; k < taps; k++)
+                {
+                    acc += r[pi[(k * dw) + dx]] * pa[(k * dw) + dx];
+                }
+
+                b[dx] = acc;
+            }
+        }
+    }
+
+    /// <summary><c>sum = β·buf</c> or <c>sum += β·buf</c>, multiply and add rounded separately.</summary>
+    private static void ScaleInto(float[] buf, float beta, float[] sum, int n, bool accumulate)
+    {
+        int x = 0;
+        var vb = new Vector<float>(beta);
+        int vw = Vector<float>.Count;
+        for (; x + vw <= n; x += vw)
+        {
+            Vector<float> p = vb * new Vector<float>(buf, x);
+            (accumulate ? new Vector<float>(sum, x) + p : p).CopyTo(sum, x);
+        }
+
+        for (; x < n; x++)
+        {
+            float p = beta * buf[x];
+            sum[x] = accumulate ? sum[x] + p : p;
+        }
+    }
+
+    /// <summary><see cref="SaturateByte"/> over a row.</summary>
+    private static void StoreBytes(ReadOnlySpan<float> sum, Span<byte> dst)
+    {
+        for (int x = 0; x < dst.Length; x++)
+        {
+            dst[x] = SaturateByte(sum[x]);
         }
     }
 

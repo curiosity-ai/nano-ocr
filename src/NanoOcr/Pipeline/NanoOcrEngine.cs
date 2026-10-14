@@ -147,6 +147,7 @@ public sealed class NanoOcrEngine
         }
 
         double cx = sw / 2.0, cy = sh / 2.0;
+        int[] nonzero = CvWarp.NonzeroTable(ink, sw, sh);
 
         // sharpness(a): the warped page's row sums (numpy's pairwise float32 sums), then the
         // pairwise sum of their squared differences. Each row is reduced as soon as it is warped,
@@ -158,8 +159,8 @@ public sealed class NanoOcrEngine
             var rows = new float[sh];
             for (int y = 0; y < sh; y++)
             {
-                CvWarp.WarpConstantZeroRow(ink, sw, sh, m, y, row);
-                rows[y] = Py.PairwiseSum(row);
+                // A row whose every chunk was skipped is all +0, whose pairwise sum is +0.
+                rows[y] = CvWarp.WarpConstantZeroRowSparse(ink, sw, sh, m, y, row, nonzero) ? Py.PairwiseSum(row) : 0f;
             }
 
             var diffs = new float[Math.Max(0, sh - 1)];
