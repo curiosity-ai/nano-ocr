@@ -21,5 +21,15 @@
     <Copyright>Copyright (c) 2026 Curiosity GmbH; Copyright (c) Datalab</Copyright>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageTags>ocr;nanoocr;indra;document-parsing;layout;markdown;pdf</PackageTags>
+    <PackageProjectUrl>https://github.com/curiosity-ai/nano-ocr</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/curiosity-ai/nano-ocr</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
   </PropertyGroup>
+
+  <!-- The repository README is the package README on nuget.org (its links are absolute for that reason). -->
+  <ItemGroup Condition="'$(IsPackable)' == 'true'">
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
 </Project>
