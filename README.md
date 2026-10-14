@@ -123,20 +123,24 @@ dotnet test tests/NanoOcr.Tests
 
 ## Performance
 
-On a 4-core shared VM (Xeon @ 2.8 GHz, AVX2), the 1700×2200 test page, warm, best of 5-7,
-measured interleaved with the Python pipeline in the same sitting (spreads of 15-40% between
+On a 4-vCPU shared VM (Intel Xeon @ 2.10 GHz, AVX-512), the 1700×2200 test page, warm, best of 7,
+measured interleaved with the Python pipeline in the same sitting (spreads of 10-40% between
 samples are normal on this machine):
 
-| | Python + ONNX Runtime | C# |
+| | Python + ONNX Runtime 1.31 | C# |
 | --- | --- | --- |
-| one page, 4 threads | 302-310 ms | 334-379 ms |
-| one page, 1 thread | 397-407 ms | 577-587 ms |
-| 12-page scan, `--cores 4`, process start included | 2.6-2.9 s | 3.6-3.8 s |
-| math page (`--math`), 4 threads | 483-523 ms | 409-535 ms |
+| one page, 1 thread | 281-290 ms | 214-230 ms |
+| one page, 4 threads | 277-327 ms | 157-168 ms |
+| allocation per warm page | — | 8 MiB, no GC |
 
-Detection runs at parity with ONNX Runtime; the gap is in the recognizer's CTC head (memory-bound
-element-wise passes over 1,678-class logits) and the deskew search, and a ~0.5 s longer cold
-start (JIT). Details, and the experiments that did not pay, are in [`CLAUDE.md`](CLAUDE.md).
+The C# figures are about twice as fast as this port was before its optimisation pass (452-510 ms
+on one thread, 297-326 on four, same sitting): 512-bit GEMM kernels, graph fusion (activation,
+residual, squeeze-excite gate and sequence mask folded into the convolutions; the CTC head's
+softmax peak fused with its convolution), rewritten depthwise and pooling kernels, a deskew search
+that skips what it can prove is blank, vectorized OpenCV ports, and pooled buffers — with every
+model output, image byte and markdown line unchanged. `nano-ocr bench page.png --threads 1` prints
+a machine header (CPU, ISA, FMA and bandwidth ceilings, jitter) before its stage timings. Details,
+and the experiments that did not pay, are in [`CLAUDE.md`](CLAUDE.md).
 
 ## Repository layout
 
