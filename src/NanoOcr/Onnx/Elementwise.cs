@@ -316,15 +316,10 @@ internal static partial class Operators
             case UnaryOp.Sigmoid: TensorPrimitives.Sigmoid(x, z); break;
             case UnaryOp.HardSwish: Activations.HardSwish(x, z); break;
             case UnaryOp.Softplus:
-                for (int i = 0; i < x.Length; i++)
-                {
-                    float v = x[i];
-                    z[i] = v > 0 ? v + MathF.Log(1f + MathF.Exp(-v)) : MathF.Log(1f + MathF.Exp(v));
-                }
-
+                Activations.Softplus(x, z);
                 break;
             case UnaryOp.Erf:
-                Activations.Erf(x, z);
+                Activations.ErfFast(x, z);
                 break;
         }
     }

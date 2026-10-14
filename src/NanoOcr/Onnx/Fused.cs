@@ -127,7 +127,7 @@ internal static partial class Operators
                         Vector512<float> d = Vector512.Load(p + ((long)k * t)) - best;
                         if (!Vector512.LessThanAll(d, floor))
                         {
-                            acc += ExpNonPositive(d);
+                            acc += Activations.ExpNonPositive(d);
                         }
                     }
 
@@ -165,7 +165,7 @@ internal static partial class Operators
                         Vector256<float> d = Vector256.Load(p + ((long)k * t)) - best;
                         if (!Vector256.LessThanAll(d, floor))
                         {
-                            acc += ExpNonPositive(d);
+                            acc += Activations.ExpNonPositive(d);
                         }
                     }
 
@@ -204,49 +204,5 @@ internal static partial class Operators
                 s[i] = acc;
             }
         }
-    }
-
-    /// <summary>
-    /// <c>exp(x)</c> for <c>x ≤ 0</c> (Cephes' <c>expf</c>: <c>x = n·ln2 + r</c>, a degree-6
-    /// polynomial in <c>r</c>, scaled by <c>2ⁿ</c>), within ~2 ulp of the true value; below −87
-    /// it returns 0. About four times cheaper than <see cref="Vector256.Exp(Vector256{float})"/>,
-    /// which evaluates in double. It only feeds the softmax peak, whose sum is already in an
-    /// order of its own.
-    /// </summary>
-    private static Vector512<float> ExpNonPositive(Vector512<float> x)
-    {
-        Vector512<float> under = Vector512.LessThan(x, Vector512.Create(-87.3f));
-        x = Vector512.Max(x, Vector512.Create(-87.3f));
-        Vector512<float> n = Vector512.Round(x * Vector512.Create(1.44269504088896341f));
-        Vector512<float> r = Vector512.FusedMultiplyAdd(n, Vector512.Create(-0.693359375f), x);
-        r = Vector512.FusedMultiplyAdd(n, Vector512.Create(2.12194440e-4f), r);
-        Vector512<float> p = Vector512.Create(1.9875691500e-4f);
-        p = Vector512.FusedMultiplyAdd(p, r, Vector512.Create(1.3981999507e-3f));
-        p = Vector512.FusedMultiplyAdd(p, r, Vector512.Create(8.3334519073e-3f));
-        p = Vector512.FusedMultiplyAdd(p, r, Vector512.Create(4.1665795894e-2f));
-        p = Vector512.FusedMultiplyAdd(p, r, Vector512.Create(1.6666665459e-1f));
-        p = Vector512.FusedMultiplyAdd(p, r, Vector512.Create(5.0000001201e-1f));
-        p = Vector512.FusedMultiplyAdd(p * r, r, r) + Vector512<float>.One;
-        Vector512<int> scale = (Vector512.ConvertToInt32(n) + Vector512.Create(127)) << 23;
-        return Vector512.AndNot(p * scale.AsSingle(), under);
-    }
-
-    /// <inheritdoc cref="ExpNonPositive(Vector512{float})"/>
-    private static Vector256<float> ExpNonPositive(Vector256<float> x)
-    {
-        Vector256<float> under = Vector256.LessThan(x, Vector256.Create(-87.3f));
-        x = Vector256.Max(x, Vector256.Create(-87.3f));
-        Vector256<float> n = Vector256.Round(x * Vector256.Create(1.44269504088896341f));
-        Vector256<float> r = Vector256.FusedMultiplyAdd(n, Vector256.Create(-0.693359375f), x);
-        r = Vector256.FusedMultiplyAdd(n, Vector256.Create(2.12194440e-4f), r);
-        Vector256<float> p = Vector256.Create(1.9875691500e-4f);
-        p = Vector256.FusedMultiplyAdd(p, r, Vector256.Create(1.3981999507e-3f));
-        p = Vector256.FusedMultiplyAdd(p, r, Vector256.Create(8.3334519073e-3f));
-        p = Vector256.FusedMultiplyAdd(p, r, Vector256.Create(4.1665795894e-2f));
-        p = Vector256.FusedMultiplyAdd(p, r, Vector256.Create(1.6666665459e-1f));
-        p = Vector256.FusedMultiplyAdd(p, r, Vector256.Create(5.0000001201e-1f));
-        p = Vector256.FusedMultiplyAdd(p * r, r, r) + Vector256<float>.One;
-        Vector256<int> scale = (Vector256.ConvertToInt32(n) + Vector256.Create(127)) << 23;
-        return Vector256.AndNot(p * scale.AsSingle(), under);
     }
 }
