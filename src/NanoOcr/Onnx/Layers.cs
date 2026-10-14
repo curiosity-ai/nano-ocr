@@ -526,15 +526,15 @@ internal static partial class Operators
             }
         }
 
-        void Plane(float[] pad, int ip, int j)
+        void Plane(float[] pad, int ip, int j, int oy0, int oy1)
         {
             int m = ((ip % p.C) * mult) + j;
             int o = ((ip / p.C) * p.M) + m;
             Span<float> dst = output.AsSpan(o * outPlane, outPlane);
-            DepthwisePlane(pad, taps, weight.AsSpan(m * p.Kh * p.Kw, p.Kh * p.Kw), bias is null ? 0f : bias[m], p, wq, dst);
+            DepthwisePlane(pad, taps, weight.AsSpan(m * p.Kh * p.Kw, p.Kh * p.Kw), bias is null ? 0f : bias[m], p, wq, dst, oy0, oy1);
             if (!epilogue.IsEmpty)
             {
-                epilogue.Apply(dst, o * outPlane);
+                epilogue.Apply(dst.Slice(oy0 * p.Ow, (oy1 - oy0) * p.Ow), (o * outPlane) + (oy0 * p.Ow));
             }
         }
 
@@ -549,7 +549,7 @@ internal static partial class Operators
                     PadPhases(input.AsSpan(ip * p.H * p.W, p.H * p.W), p, hp, wq, pad);
                     for (int j = 0; j < mult; j++)
                     {
-                        Plane(pad, ip, j);
+                        Plane(pad, ip, j, 0, p.Oh);
                     }
                 }
 
@@ -558,16 +558,23 @@ internal static partial class Operators
             return;
         }
 
-        // Few input planes, many filters each (the stems): pad once, spread the filters.
+        // Few input planes, many filters each (the stems): pad once, then bands of output rows,
+        // every filter over a band before the next, so the band's input stays in cache instead
+        // of the whole padded plane being streamed once per filter.
         float[] shared = System.Buffers.ArrayPool<float>.Shared.Rent(scratch);
+        const int Band = 8;
+        int bands = (p.Oh + Band - 1) / Band;
         for (int ip = 0; ip < inPlanes; ip++)
         {
             PadPhases(input.AsSpan(ip * p.H * p.W, p.H * p.W), p, hp, wq, shared);
-            Parallelism.For(mult, work / inPlanes, (s, e) =>
+            Parallelism.For(bands, work / inPlanes, (s, e) =>
             {
-                for (int j = s; j < e; j++)
+                for (int band = s; band < e; band++)
                 {
-                    Plane(shared, ip, j);
+                    for (int j = 0; j < mult; j++)
+                    {
+                        Plane(shared, ip, j, band * Band, Math.Min(p.Oh, (band + 1) * Band));
+                    }
                 }
             });
         }
@@ -637,7 +644,7 @@ internal static partial class Operators
         }
     }
 
-    private static unsafe void DepthwisePlane(float[] pad, int[] taps, ReadOnlySpan<float> w, float bias, ConvParams p, int wq, Span<float> dst)
+    private static unsafe void DepthwisePlane(float[] pad, int[] taps, ReadOnlySpan<float> w, float bias, ConvParams p, int wq, Span<float> dst, int oy0, int oy1)
     {
         int nt = taps.Length;
         fixed (float* src = pad)
@@ -645,7 +652,7 @@ internal static partial class Operators
         fixed (float* wp = w)
         fixed (float* d = dst)
         {
-            for (int oy = 0; oy < p.Oh; oy++)
+            for (int oy = oy0; oy < oy1; oy++)
             {
                 float* row = src + (oy * p.Sh * wq);
                 float* o = d + (oy * p.Ow);
@@ -1078,6 +1085,40 @@ internal static partial class Operators
         Tensor result = Tensor.Float(outShape);
         float[] src = input.FloatArray, dst = result.FloatArray;
         int planes = outShape[0] * outShape[1];
+        bool doubling = oh == 2 * h && ow == 2 * w && ys.Select((v, i) => v == i / 2).All(b => b) && xs.Select((v, i) => v == i / 2).All(b => b);
+        if (doubling && Vector256.IsHardwareAccelerated)
+        {
+            // The FPN's nearest 2× upsample: each source row, every pixel twice, written to two rows.
+            Parallelism.For(planes, (long)planes * oh * ow, (s, e) =>
+            {
+                for (int plane = s; plane < e; plane++)
+                {
+                    for (int y = 0; y < h; y++)
+                    {
+                        ReadOnlySpan<float> row = src.AsSpan((plane * h * w) + (y * w), w);
+                        Span<float> d0 = dst.AsSpan((plane * oh * ow) + (2 * y * ow), ow);
+                        int x = 0;
+                        for (; x + 8 <= w; x += 8)
+                        {
+                            Vector256<float> v = Vector256.Create(row.Slice(x, 8));
+                            Vector256<float> lo = Vector256.Shuffle(v, Vector256.Create(0, 0, 1, 1, 2, 2, 3, 3));
+                            Vector256<float> hi = Vector256.Shuffle(v, Vector256.Create(4, 4, 5, 5, 6, 6, 7, 7));
+                            lo.CopyTo(d0.Slice(2 * x, 8));
+                            hi.CopyTo(d0.Slice((2 * x) + 8, 8));
+                        }
+
+                        for (; x < w; x++)
+                        {
+                            d0[2 * x] = d0[(2 * x) + 1] = row[x];
+                        }
+
+                        d0.CopyTo(dst.AsSpan((plane * oh * ow) + (((2 * y) + 1) * ow), ow));
+                    }
+                }
+            });
+            return result;
+        }
+
         Parallelism.For(planes, (long)planes * oh * ow, (s, e) =>
         {
             for (int plane = s; plane < e; plane++)

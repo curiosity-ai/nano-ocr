@@ -12,6 +12,19 @@ internal static class Activations
     public static void HardSwish(ReadOnlySpan<float> x, Span<float> z)
     {
         int i = 0;
+        if (Core.Gemm.Wide)
+        {
+            // The same three operations per element on 512-bit lanes: identical results.
+            var sixth512 = Vector512.Create(1f / 6f);
+            var half512 = Vector512.Create(0.5f);
+            for (; i + 16 <= x.Length; i += 16)
+            {
+                var v = Vector512.Create(x.Slice(i, 16));
+                Vector512<float> g = Vector512.Min(Vector512<float>.One, Vector512.Max(Vector512<float>.Zero, (v * sixth512) + half512));
+                (v * g).CopyTo(z.Slice(i, 16));
+            }
+        }
+
         int vw = Vector<float>.Count;
         var sixth = new Vector<float>(1f / 6f);
         var half = new Vector<float>(0.5f);
