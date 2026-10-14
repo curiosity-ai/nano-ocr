@@ -885,6 +885,6 @@ public sealed class NanoOcrEngine
             md = string.Join("\n", texts);
         }
 
-        return new Page { Lines = lines, Timings = t, Markdown = md, Note = note, Blocks = blocks, Elements = elements };
+        return new Page { Lines = lines, Timings = t, Markdown = md, Note = note, Blocks = blocks, Elements = elements, Width = pageW, Height = pageH };
     }
 }

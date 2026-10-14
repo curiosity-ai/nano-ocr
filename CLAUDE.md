@@ -29,7 +29,8 @@ images; PDFium (native, via P/Invoke — the engine pypdfium2 wraps) renders PDF
 | `src/NanoOcr/Pipeline/NanoOcrEngine.cs` | `pipeline.py` (`OrtOCR`, deskew, orientation) |
 | `src/NanoOcr/Pipeline/Py.cs` | Python/numpy semantics (see below) |
 | `src/NanoOcr/NanoOCR.cs`, `OcrResult.cs` | `__init__.load`, `parallel.convert_many`; the PaddleOCR-style API |
-| `src/NanoOcr.Cli/` | `cli.py` (`indra-ocr`; here `nano-ocr`), plus `bench` and `bench-gemm` |
+| `src/NanoOcr/Routing/` | not Indra: `PageClassifier` (category from a page's reading; calibrated on RVL-CDIP, figures in its doc comment) and `PageRouter<TOutput>` (category → recognizer, generic on the output) |
+| `src/NanoOcr.Cli/` | `cli.py` (`indra-ocr`; here `nano-ocr`), plus `classify`, `bench` and `bench-gemm` |
 | `src/NanoOcr/Models/Assets/` | the `v3.1` models of `datalab-to/indra-ocr`, embedded as resources (hashes in its README) |
 
 Not ported: `viewer.py` (a local web viewer), `bench/opb_indra.py` (OmniParseBench harness), the

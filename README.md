@@ -97,6 +97,7 @@ nano-ocr scan.png --no-fusion --gemm-256 # graphs as written, 256-bit kernels (A
 nano-ocr scan.png --save-img out/        # draw blocks and lines over the page
 nano-ocr paper.pdf --merge-tables --title-levels   # rejoin split tables, heading depth from the document
 nano-ocr paper.pdf --md-style reference  # the Python original's markdown, byte for byte
+nano-ocr classify *.pdf                  # each page's category and signals (see Routing pages)
 nano-ocr bench page.png                  # warm stage timings, per-operator profile
 ```
 
@@ -140,6 +141,52 @@ NanoOCR's layout blocks:
 With `MergeTables` or `TitleLevels`, `NanoOCR.Predict` returns a file's pages once its last page is
 done. A caller driving `NanoOcrEngine` or `DocumentConverter` directly calls
 `MarkdownDocument.Finish(pages, options)` on a document's pages for the same result.
+
+## Routing pages
+
+`PageRouter<TOutput>` reads each page with NanoOCR, sorts it into a `PageCategory` —
+`PrintedText`, `Handwritten`, `TableOrComplex` or `Mixed` — and hands it to the recognizer
+registered for that category, falling back to a default. It is generic on the output, so
+NanoOCR's own reading and another engine (PaddleOCR-VL, say) can share it through a conversion of
+their results:
+
+```csharp
+using var nano = new NanoOCR(new NanoOcrOptions { KeepImages = true });
+var router = new PageRouter<string>(nano)
+    .When(PageCategory.PrintedText, page => page.Ocr.Markdown)          // NanoOCR's reading is the answer
+    .When(c => c.Signals.Tables > 2, page => VlMarkdown(page))          // predicates refine; first match wins
+    .When(PageCategory.Handwritten, page => VlMarkdown(page))
+    .Otherwise(page => VlMarkdown(page));                               // TableOrComplex, Mixed, …
+
+foreach (RoutedResult<string> r in router.Route("scans/batch.pdf"))
+    Console.WriteLine($"page {r.Page.PageIndex + 1}: {r.Page.Category} ({r.Page.Classification.Reason})");
+```
+
+A recognizer gets a `RoutedPage`: NanoOCR's `OcrResult` (the page image on it when `KeepImages`
+is on), the input path and page index (or the bytes, for `Route(byte[])`), and the
+classification. Asynchronous recognizers (`(page, ct) => ValueTask<T>`) go through the same
+`When`/`Otherwise`, with `RouteAsync` returning an `IAsyncEnumerable`. Routes are tried in the
+order they were added; with no `Otherwise`, a page no route takes throws.
+
+The default classifier (`PageClassifier`) needs no model of its own — it decides from the reading
+NanoOCR already made, so classifying costs nothing more than reading the page (~0.1-0.2 s):
+
+| Category | Rule (every figure relative to the page, so independent of resolution) |
+| --- | --- |
+| `Mixed` | fewer than 3 lines, or a failed page |
+| `Handwritten` | most lines unread (≥45% below 0.6 confidence, mean < 0.75) — the recognizer is trained on print — **and** written large (median line ≥1.2% of the page height) or in long strokes (≥8% of lines wider than a quarter of the page); never a PDF text layer |
+| `Mixed` | mostly unread, in small type: degraded print, a fax, noise |
+| `TableOrComplex` | ≥25% of the lines in the order model's `Table` or `Form` blocks |
+| `Mixed` | printed, but mean confidence < 0.85 or ≥35% of lines unread |
+| `PrintedText` | everything else |
+
+It was calibrated on 160 RVL-CDIP pages and checked on 400 others (fax-quality 1990s scans, the
+hard case). On the 400 it finds 80% of the handwritten pages, and 56% of its handwriting calls are
+right (large-type adverts make up most of the rest); 83% of its printed calls are printed. **It
+never called a handwritten page printed** — the one error that would hand a page NanoOCR cannot
+read to NanoOCR. The thresholds are `PageClassifierOptions`; a trained classifier plugs in through
+`new PageRouter<T>(nano, result => …)`, and `nano-ocr classify` prints every signal per page for
+tuning on your own documents.
 
 ## Validation
 

@@ -117,6 +117,14 @@ public sealed class Page
     [JsonIgnore]
     public List<PageElement>? Elements { get; set; }
 
+    /// <summary>Width of the (upright) page image in pixels; 0 for an error page.</summary>
+    [JsonIgnore]
+    public int Width { get; set; }
+
+    /// <summary>Height of the (upright) page image in pixels; 0 for an error page.</summary>
+    [JsonIgnore]
+    public int Height { get; set; }
+
     /// <summary>Degrees counter-clockwise the input was turned; boxes are in the upright page.</summary>
     [JsonPropertyName("rotation")]
     public int Rotation { get; set; }

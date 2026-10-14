@@ -9,7 +9,7 @@ using NanoOcr.Pipeline;
 //   nano-ocr paper.pdf                    # markdown to stdout
 //   nano-ocr *.pdf --out results/         # one .md per input
 //   nano-ocr scan.png --format json       # lines with boxes, confidences, timings
-return args.Length > 0 && args[0] == "bench" ? Bench.Run(args[1..]) : args.Length > 0 && args[0] == "bench-gemm" ? GemmBench.Run(args[1..]) : Cli.Run(args);
+return args.Length > 0 && args[0] == "bench" ? Bench.Run(args[1..]) : args.Length > 0 && args[0] == "classify" ? Classify.Run(args[1..]) : args.Length > 0 && args[0] == "bench-gemm" ? GemmBench.Run(args[1..]) : Cli.Run(args);
 
 internal static class Cli
 {
