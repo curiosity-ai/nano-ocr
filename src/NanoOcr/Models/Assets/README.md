@@ -2,7 +2,7 @@
 
 These are the Indra OCR models from the Hugging Face repository
 [`datalab-to/indra-ocr`](https://huggingface.co/datalab-to/indra-ocr), tag `v3.1` — the model
-set the Python package 0.3.1 (in `.reference/`) was built and tested against. They are compiled
+set the Python package 0.3.1 (`https://github.com/datalab-to/indra`) was built and tested against. They are compiled
 into `NanoOcr.dll` as embedded resources, so the library needs no download at run time.
 
 | File | SHA-256 |

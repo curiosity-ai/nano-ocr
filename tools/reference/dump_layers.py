@@ -26,7 +26,6 @@ import onnx
 import onnxruntime as ort
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / ".reference"))
 
 from indra_ocr.det_post import decode, page_to_input  # noqa: E402
 from indra_ocr.order_post import line_features  # noqa: E402

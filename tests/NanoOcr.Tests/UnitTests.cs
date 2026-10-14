@@ -7,7 +7,7 @@ using Xunit;
 namespace NanoOcr.Tests;
 
 /// <summary>
-/// The Python package's own unit tests (<c>.reference/tests</c>), ported, plus checks of the
+/// The Python package's own unit tests (in the original repository, <c>tests/</c>), ported, plus checks of the
 /// Python-semantics helpers the port leans on.
 /// </summary>
 public class UnitTests

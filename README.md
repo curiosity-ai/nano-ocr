@@ -18,8 +18,7 @@ plus the PDF text layer, Chinese routing and the optional LaTeX math reader.
 - SkiaSharp decodes images; PDFium (the same engine pypdfium2 wraps) renders PDFs and reads their
   text layer; multi-page TIFF (including CCITT G3/G4 fax) is decoded in-library.
 
-The original Python implementation is kept unchanged in [`.reference/`](https://github.com/curiosity-ai/nano-ocr/tree/main/.reference) as the
-normative specification.
+The original Python implementation, [Indra OCR](https://github.com/datalab-to/indra), is the normative specification.
 
 ## Install
 
@@ -302,7 +301,6 @@ tests/NanoOcr.Tests/     parity and unit tests
 tools/reference/         Python scripts that produce the reference fixtures
 tools/pagetype/          training and evaluation of the page-type model
 .devops/                 the Azure DevOps pipeline that publishes the packages
-.reference/              the original Python package, unchanged
 ```
 
 ## License
