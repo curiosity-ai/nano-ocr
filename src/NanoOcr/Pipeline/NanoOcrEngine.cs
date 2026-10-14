@@ -310,13 +310,42 @@ public sealed class NanoOcrEngine
     /// <summary><c>upright</c>: the page turned upright and straightened, with the quarter turns and skew undone.</summary>
     public (GrayImage Page, int QuarterTurns, double Skew) Upright(GrayImage gray, bool turn = true)
     {
-        int k = turn ? Orientation(gray) : 0;
+        int k = 0;
+        double a = double.NaN;
+        if (turn && _orient is not null && Core.Parallelism.Workers > 1)
+        {
+            // With threads to spare, estimate the skew of the page as given while the orientation
+            // model runs: most pages need no quarter turn, and when one does, the estimate is
+            // simply redone on the turned page below — the same result either way.
+            GrayImage page = gray;
+            Core.Parallelism.Jobs([1.4, 1.0], job =>
+            {
+                if (job == 0)
+                {
+                    k = Orientation(page);
+                }
+                else
+                {
+                    a = EstimateSkew(page);
+                }
+            });
+        }
+        else if (turn)
+        {
+            k = Orientation(gray);
+        }
+
         if (k != 0)
         {
             gray = gray.RotateClockwise(k);
+            a = double.NaN;
         }
 
-        double a = EstimateSkew(gray);
+        if (double.IsNaN(a))
+        {
+            a = EstimateSkew(gray);
+        }
+
         if (Math.Abs(a) >= DeskewMin)
         {
             gray = RotatePage(gray, a);
