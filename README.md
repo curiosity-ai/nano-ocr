@@ -1,6 +1,6 @@
-# Indra OCR for .NET
+# NanoOCR
 
-A pure C# port of [Indra OCR](https://github.com/datalab-to/indra) (Datalab's 1M-parameter CPU
+NanoOCR is a pure C# port of [Indra OCR](https://github.com/datalab-to/indra) (Datalab's 1M-parameter CPU
 OCR pipeline): line detection, CTC line recognition, reading order, layout classes and markdown,
 plus the PDF text layer, Chinese routing and the optional LaTeX math reader.
 
@@ -8,7 +8,7 @@ plus the PDF text layer, Chinese routing and the optional LaTeX math reader.
   interpreter and SIMD kernels (`System.Numerics.Tensors`, `Vector<T>`, AVX2 gathers); the image
   operations the pipeline needs are bit-exact ports of OpenCV's.
 - **Models embedded.** The `v3.1` model set (det, rec, rec_cjk, script, order, orient and the four
-  math models, 38 MB) is compiled into `IndraOcr.dll` — no download, no model folder.
+  math models, 38 MB) is compiled into `NanoOcr.dll` — no download, no model folder.
 - **Validated layer by layer.** Every node output of every model matches ONNX Runtime, every image
   operation matches OpenCV byte for byte, and every pipeline stage matches the Python reference
   — down to identical markdown on the test corpus (see [Validation](#validation)).
@@ -21,9 +21,9 @@ normative specification.
 ## Quick start
 
 ```csharp
-using IndraOcr;
+using NanoOcr;
 
-using var ocr = new IndraOCR();                 // embedded models, all cores
+using var ocr = new NanoOCR();                 // embedded models, all cores
 foreach (OcrResult res in ocr.Predict("paper.pdf"))
 {
     res.Print();                                 // lines with boxes and confidences
@@ -36,14 +36,14 @@ foreach (OcrResult res in ocr.Predict("paper.pdf"))
 The API follows PaddleOCR's: `Predict` returns one result per page, and each result exposes the
 PaddleOCR fields alongside Indra's own.
 
-| PaddleOCR | Indra OCR for .NET |
+| PaddleOCR | NanoOCR |
 | --- | --- |
-| `PaddleOCR(...)` | `new IndraOCR(new IndraOcrOptions { ... })` |
+| `PaddleOCR(...)` | `new NanoOCR(new NanoOcrOptions { ... })` |
 | `ocr.predict(input)` | `ocr.Predict(path)` — a file or a directory; also `Predict(byte[])`, `Predict(SKBitmap)`, `Predict(GrayImage)` |
 | `ocr.ocr(img)` (2.x) | `ocr.Ocr(path)` — per page, `(corner points, (text, score))` |
 | `res["rec_texts"]`, `rec_scores`, `rec_boxes`, `dt_polys` | `res.RecTexts`, `RecScores`, `RecBoxes`, `DtPolys` |
 | `res.print()`, `save_to_json`, `save_to_markdown`, `save_to_img` | `res.Print()`, `SaveToJson`, `SaveToMarkdown`, `SaveToImg` |
-| `use_doc_orientation_classify` | `IndraOcrOptions.UseDocOrientationClassify` |
+| `use_doc_orientation_classify` | `NanoOcrOptions.UseDocOrientationClassify` |
 | — | `res.Markdown`, `res.Blocks` (labelled layout blocks in reading order), `res.Page` (everything) |
 
 Many files on many cores (the counterpart of Python's `convert_many`): pages run one per core,
@@ -59,7 +59,7 @@ foreach (var (path, pages, error) in ocr.PredictMany(files, cores: 8))
 
 ### Options
 
-`IndraOcrOptions` carries the arguments of Python's `indra_ocr.load`:
+`NanoOcrOptions` carries the arguments of Python's `indra_ocr.load`:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -70,25 +70,25 @@ foreach (var (path, pages, error) in ocr.PredictMany(files, cores: 8))
 | `Furniture` | false | keep page headers and footers in the markdown |
 | `Math` | false | read math as LaTeX (`$...$`); slower on math pages |
 | `Threads` | all cores | kernel threads for one page |
-| `ModelDir` | embedded | a folder laid out like the Hugging Face repository instead (`INDRA_OCR_MODEL_DIR` also works) |
+| `ModelDir` | embedded | a folder laid out like the Hugging Face repository instead (`NANO_OCR_MODEL_DIR` also works, as does the original's `INDRA_OCR_MODEL_DIR`) |
 | `KeepImages` | false | keep page images on the results (for `SaveToImg`) |
 
-Stage-level access is public too: `IndraEngine` (the port of `OrtOCR`: `Detect`, `Recognize`,
-`Upright`, `Assemble`, …), `DocumentConverter`, `IndraOcr.Onnx.InferenceSession` (run any of the
-models, or another ONNX file using the same operators), and the OpenCV ports in `IndraOcr.Imaging`.
+Stage-level access is public too: `NanoOcrEngine` (the port of `OrtOCR`: `Detect`, `Recognize`,
+`Upright`, `Assemble`, …), `DocumentConverter`, `NanoOcr.Onnx.InferenceSession` (run any of the
+models, or another ONNX file using the same operators), and the OpenCV ports in `NanoOcr.Imaging`.
 
 ## Command line
 
-`src/IndraOcr.Cli` builds `indra-ocr`, with the Python command's options:
+`src/NanoOcr.Cli` builds `nano-ocr`, with the Python `indra-ocr` command's options:
 
 ```shell
-indra-ocr paper.pdf                       # markdown to stdout
-indra-ocr *.pdf --out results/            # one .md per input
-indra-ocr scan.png --format json          # lines, boxes, layout blocks, confidences, timings
-indra-ocr paper.pdf --mode ocr --timings  # ignore the text layer; timings on stderr
-indra-ocr paper.pdf --math                # write math as LaTeX
-indra-ocr scan.png --save-img out/        # draw blocks and lines over the page
-indra-ocr bench page.png                  # warm stage timings, per-operator profile
+nano-ocr paper.pdf                       # markdown to stdout
+nano-ocr *.pdf --out results/            # one .md per input
+nano-ocr scan.png --format json          # lines, boxes, layout blocks, confidences, timings
+nano-ocr paper.pdf --mode ocr --timings  # ignore the text layer; timings on stderr
+nano-ocr paper.pdf --math                # write math as LaTeX
+nano-ocr scan.png --save-img out/        # draw blocks and lines over the page
+nano-ocr bench page.png                  # warm stage timings, per-operator profile
 ```
 
 ## Output
@@ -118,7 +118,7 @@ python tools/reference/make_test_documents.py tests/data/documents       # the c
 python tools/reference/dump_layers.py   --models /path/to/indra-ocr        # per-layer fixtures
 python tools/reference/dump_imaging.py                                     # OpenCV fixtures
 python tools/reference/dump_pipeline.py --models /path/to/indra-ocr        # stage fixtures
-dotnet test tests/IndraOcr.Tests
+dotnet test tests/NanoOcr.Tests
 ```
 
 ## Performance
@@ -141,16 +141,16 @@ start (JIT). Details, and the experiments that did not pay, are in [`CLAUDE.md`]
 ## Repository layout
 
 ```
-src/IndraOcr/            the library (NuGet: IndraOCR)
+src/NanoOcr/             the library (NuGet: NanoOCR)
   Onnx/                  protobuf reader, InferenceSession, operator kernels
   Core/                  GEMM, parallelism
   Imaging/               OpenCV ports, SkiaSharp IO, TIFF/CCITT
   Pdf/                   PDFium bindings
   Pipeline/              the Indra pipeline (one file per Python module)
   Models/Assets/         the embedded models (OpenRAIL-M, see MODEL_LICENSE)
-  IndraOCR.cs            the PaddleOCR-style API
-src/IndraOcr.Cli/        indra-ocr
-tests/IndraOcr.Tests/    parity and unit tests
+  NanoOCR.cs             the PaddleOCR-style API
+src/NanoOcr.Cli/         nano-ocr
+tests/NanoOcr.Tests/     parity and unit tests
 tools/reference/         Python scripts that produce the reference fixtures
 .reference/              the original Python package, unchanged
 ```
@@ -158,5 +158,5 @@ tools/reference/         Python scripts that produce the reference fixtures
 ## License
 
 The code is Apache 2.0 (`LICENSE`). The model weights are Datalab's, under their modified
-OpenRAIL-M license (`src/IndraOcr/Models/Assets/MODEL_LICENSE`): free for research, personal use
+OpenRAIL-M license (`src/NanoOcr/Models/Assets/MODEL_LICENSE`): free for research, personal use
 and startups under $20M in funding or revenue, and not for use competing with Datalab's API.

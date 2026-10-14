@@ -1,6 +1,6 @@
-# Indra OCR — Pure C# Port
+# NanoOCR — Pure C# Port of Indra OCR
 
-This repository is a **pure C# re-implementation of Indra OCR** (the Python package `indra-ocr`
+This repository is **NanoOCR, a pure C# re-implementation of Indra OCR** (the Python package `indra-ocr`
 0.3.1, Datalab). The original Python sources live unchanged in [`.reference/`](.reference/) and
 are the **normative specification: when C# and Python disagree, Python is right.** The original
 PyPI publish workflow is disabled (`.github/workflows/publish.yml.disabled`); do not re-enable it.
@@ -13,23 +13,23 @@ images; PDFium (native, via P/Invoke — the engine pypdfium2 wraps) renders PDF
 
 | Path | Port of |
 | --- | --- |
-| `src/IndraOcr/Onnx/` | ONNX Runtime: `ProtoReader` + `OnnxModel` (ModelProto, no protobuf runtime), `InferenceSession` (slot-compiled, constant-folded graph), `Operators` (≈55 ops) |
-| `src/IndraOcr/Core/` | MLAS's role: `Gemm` (packed 6×16 `Vector<T>` micro-kernel), `Parallelism` |
-| `src/IndraOcr/Imaging/` | OpenCV: `CvResize` (`resize` linear/area), `CvWarp` (`warpAffine`, `getRotationMatrix2D`), `ConnectedComponents`; `ImageIO` (SkiaSharp + libpng's gray formula), `TiffDecoder` + `Ccitt` (`imreadmulti`) |
-| `src/IndraOcr/Pdf/` | pypdfium2: `Pdfium` (P/Invoke), `PdfDocument`, `PdfPage.Render` |
-| `src/IndraOcr/Pipeline/Detection.cs` | `det_post.py` |
-| `src/IndraOcr/Pipeline/LineCrops.cs` | `rec_preproc.py`, `line_mask.crop_lines` |
-| `src/IndraOcr/Pipeline/Vocab.cs` | `vocab.py` (the inference parts) |
-| `src/IndraOcr/Pipeline/ReadingOrder.cs` | `order_post.py` |
-| `src/IndraOcr/Pipeline/Layout.cs` | `layout_post.py` |
-| `src/IndraOcr/Pipeline/MathReader.cs` | `math.py` |
-| `src/IndraOcr/Pipeline/TextLayer.cs` | `textlayer.py` |
-| `src/IndraOcr/Pipeline/DocumentConverter.cs` | `document.py` |
-| `src/IndraOcr/Pipeline/IndraEngine.cs` | `pipeline.py` (`OrtOCR`, deskew, orientation) |
-| `src/IndraOcr/Pipeline/Py.cs` | Python/numpy semantics (see below) |
-| `src/IndraOcr/IndraOCR.cs`, `OcrResult.cs` | `__init__.load`, `parallel.convert_many`; the PaddleOCR-style API |
-| `src/IndraOcr.Cli/` | `cli.py` (`indra-ocr`), plus `bench` and `bench-gemm` |
-| `src/IndraOcr/Models/Assets/` | the `v3.1` models of `datalab-to/indra-ocr`, embedded as resources (hashes in its README) |
+| `src/NanoOcr/Onnx/` | ONNX Runtime: `ProtoReader` + `OnnxModel` (ModelProto, no protobuf runtime), `InferenceSession` (slot-compiled, constant-folded graph), `Operators` (≈55 ops) |
+| `src/NanoOcr/Core/` | MLAS's role: `Gemm` (packed 6×16 `Vector<T>` micro-kernel), `Parallelism` |
+| `src/NanoOcr/Imaging/` | OpenCV: `CvResize` (`resize` linear/area), `CvWarp` (`warpAffine`, `getRotationMatrix2D`), `ConnectedComponents`; `ImageIO` (SkiaSharp + libpng's gray formula), `TiffDecoder` + `Ccitt` (`imreadmulti`) |
+| `src/NanoOcr/Pdf/` | pypdfium2: `Pdfium` (P/Invoke), `PdfDocument`, `PdfPage.Render` |
+| `src/NanoOcr/Pipeline/Detection.cs` | `det_post.py` |
+| `src/NanoOcr/Pipeline/LineCrops.cs` | `rec_preproc.py`, `line_mask.crop_lines` |
+| `src/NanoOcr/Pipeline/Vocab.cs` | `vocab.py` (the inference parts) |
+| `src/NanoOcr/Pipeline/ReadingOrder.cs` | `order_post.py` |
+| `src/NanoOcr/Pipeline/Layout.cs` | `layout_post.py` |
+| `src/NanoOcr/Pipeline/MathReader.cs` | `math.py` |
+| `src/NanoOcr/Pipeline/TextLayer.cs` | `textlayer.py` |
+| `src/NanoOcr/Pipeline/DocumentConverter.cs` | `document.py` |
+| `src/NanoOcr/Pipeline/NanoOcrEngine.cs` | `pipeline.py` (`OrtOCR`, deskew, orientation) |
+| `src/NanoOcr/Pipeline/Py.cs` | Python/numpy semantics (see below) |
+| `src/NanoOcr/NanoOCR.cs`, `OcrResult.cs` | `__init__.load`, `parallel.convert_many`; the PaddleOCR-style API |
+| `src/NanoOcr.Cli/` | `cli.py` (`indra-ocr`; here `nano-ocr`), plus `bench` and `bench-gemm` |
+| `src/NanoOcr/Models/Assets/` | the `v3.1` models of `datalab-to/indra-ocr`, embedded as resources (hashes in its README) |
 
 Not ported: `viewer.py` (a local web viewer), `bench/opb_indra.py` (OmniParseBench harness), the
 CenterMask path of `line_mask.py` (the v3.1 model set ships no `mask.onnx`), and the training-only
@@ -67,18 +67,18 @@ fixtures generated; a change that moves an output must say why.
 ## Building and testing
 
 ```bash
-dotnet build IndraOcr.slnx -c Release
-dotnet test tests/IndraOcr.Tests            # or: dotnet run -c Release --project tests/IndraOcr.Tests
+dotnet build NanoOcr.slnx -c Release
+dotnet test tests/NanoOcr.Tests            # or: dotnet run -c Release --project tests/NanoOcr.Tests
 ```
 
 ## Performance record
 
 Method: [`measuring-performance`](https://github.com/theolivenbaum/PaddleOCR/tree/main/.claude/skills/measuring-performance)
 (the sibling port's skill) — warm runs, best of N with the spread, interleaved A/B against Python,
-an untouched stage as control, outputs pinned by the parity tests. `indra-ocr bench page.png
+an untouched stage as control, outputs pinned by the parity tests. `nano-ocr bench page.png
 [--threads N]` prints stage timings, the spread, cold start, allocation, GC pauses and a
 per-operator profile (`BENCH_MODELS=rec` picks the models, `BENCH_MATH=1` the math reader);
-`indra-ocr bench-gemm` prints GEMM throughput at the models' shapes.
+`nano-ocr bench-gemm` prints GEMM throughput at the models' shapes.
 
 Measured on a 4-core shared VM (Xeon @ 2.8 GHz, AVX2), 1700×2200 page, against the Python
 pipeline in the same sitting:

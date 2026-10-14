@@ -6,7 +6,7 @@
 For each model this writes ``<model>.npz`` holding the graph inputs (``in.<k>``), and the output
 of every node in execution order (``v.<k>``), plus ``<model>.json`` naming them:
 {"inputs": [names], "values": [names]}. The C# parity tests (LayerParityTests) feed the same
-inputs to IndraOcr.Onnx.InferenceSession and compare each node output.
+inputs to NanoOcr.Onnx.InferenceSession and compare each node output.
 
 The inputs are the real ones the pipeline builds — a detector input made by page_to_input, line
 crops made by crop_line, order features made by line_features, ... — so the tensors cover the

@@ -3,7 +3,7 @@
     python tools/reference/dump_imaging.py --docs tests/data/documents --out tests/data/reference/imaging
 
 Writes ``imaging.npz`` and ``imaging.json``; ImagingParityTests checks the C# ports
-(IndraOcr.Imaging.CvResize / CvWarp / ConnectedComponents / ImageIO) against them.
+(NanoOcr.Imaging.CvResize / CvWarp / ConnectedComponents / ImageIO) against them.
 Each case is a named input, an operation with its arguments, and OpenCV's output.
 """
 

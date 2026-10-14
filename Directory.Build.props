@@ -16,10 +16,10 @@
     <Version>0.1.0</Version>
     <Company>Curiosity GmbH</Company>
     <Authors>Curiosity GmbH and the Indra OCR authors</Authors>
-    <Product>IndraOcrSharp</Product>
-    <Description>Pure C# port of the Indra OCR pipeline (line detection, CTC recognition, reading order, layout and markdown). No ONNX Runtime, no OpenCV.</Description>
+    <Product>NanoOcrSharp</Product>
+    <Description>NanoOCR: a pure C# port of the Indra OCR pipeline (line detection, CTC recognition, reading order, layout and markdown). No ONNX Runtime, no OpenCV.</Description>
     <Copyright>Copyright (c) 2026 Curiosity GmbH; Copyright (c) Datalab</Copyright>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
-    <PackageTags>ocr;indra;document-parsing;layout;markdown;pdf</PackageTags>
+    <PackageTags>ocr;nanoocr;indra;document-parsing;layout;markdown;pdf</PackageTags>
   </PropertyGroup>
 </Project>
