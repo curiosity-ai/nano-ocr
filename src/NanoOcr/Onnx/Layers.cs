@@ -85,7 +85,7 @@ internal static partial class Operators
         // A residual of another shape (a broadcast) is added after the convolution instead.
         bool fuseResidual = residual is not null && residual.Type == ElementType.Float && residual.Shape.AsSpan().SequenceEqual(output.Shape);
         var epilogue = new Epilogue(fuseResidual ? residual!.FloatArray : null, ParseActivation(residual is null || fuseResidual ? act : ""));
-        if (group == c && group == m && cg == 1)
+        if (group == c && cg == 1 && m % c == 0)
         {
             Depthwise(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p, epilogue);
         }
@@ -367,100 +367,149 @@ internal static partial class Operators
     }
 
     /// <summary>
-    /// Depthwise convolution: one filter per channel. Each plane is first copied into a zero-padded
-    /// scratch plane split into <c>stride</c> column phases, so that for every tap the inputs of
-    /// consecutive output columns are consecutive floats (a stride-2 row becomes two stride-1
-    /// rows); then each vector of output columns accumulates all <c>kh·kw</c> taps in a register,
-    /// bias first and taps in row-major order, one fused multiply-add per tap. A padded tap adds
-    /// <c>0·w</c>, which leaves the sum unchanged, so the padding needs no bounds checks.
+    /// Depthwise convolution — one input channel per group, <c>M / C</c> filters per channel (one
+    /// for an ordinary depthwise layer, sixteen for a stem over a single gray channel). Each input
+    /// plane is first copied into a zero-padded scratch plane split into <c>stride</c> column
+    /// phases, so that for every tap the inputs of consecutive output columns are consecutive
+    /// floats (a stride-2 row becomes two stride-1 rows); then each vector of output columns
+    /// accumulates all <c>kh·kw</c> taps in a register, bias first and taps in row-major order,
+    /// one fused multiply-add per tap, four vectors at a time so the chains overlap. A padded tap
+    /// adds <c>0·w</c>, which leaves the sum unchanged, so the padding needs no bounds checks.
     /// </summary>
     private static void Depthwise(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
     {
-        int planes = n * p.C;
-        long work = (long)planes * p.Oh * p.Ow * p.Kh * p.Kw;
+        int inPlanes = n * p.C;
+        int mult = p.M / p.C;
+        int outPlane = p.Oh * p.Ow;
 
         // The padded plane: rows -Pt .. (Oh-1)·Sh + (Kh-1)·Dh - Pt, likewise columns; each of the
-        // Sw phases holds every Sw-th padded column, with a vector of slack for the last chunk.
+        // Sw phases holds every Sw-th padded column, with slack for the widest vector step.
         int hp = ((p.Oh - 1) * p.Sh) + ((p.Kh - 1) * p.Dh) + 1;
         int wp = ((p.Ow - 1) * p.Sw) + ((p.Kw - 1) * p.Dw) + 1;
         int wq = ((wp + p.Sw - 1) / p.Sw) + 16;
         int scratch = p.Sw * hp * wq;
-        Parallelism.For(planes, work, (s, e) =>
+        int[] taps = new int[p.Kh * p.Kw];
+        for (int ky = 0, t = 0; ky < p.Kh; ky++)
         {
-            float[] pad = System.Buffers.ArrayPool<float>.Shared.Rent(scratch);
-            Span<int> taps = stackalloc int[p.Kh * p.Kw];
-            try
+            for (int kx = 0; kx < p.Kw; kx++, t++)
             {
-                for (int plane = s; plane < e; plane++)
-                {
-                    int ch = plane % p.C;
-                    PadPhases(input.AsSpan(plane * p.H * p.W, p.H * p.W), p, hp, wq, pad);
-                    for (int ky = 0, t = 0; ky < p.Kh; ky++)
-                    {
-                        for (int kx = 0; kx < p.Kw; kx++, t++)
-                        {
-                            int c = kx * p.Dw;
-                            taps[t] = ((c % p.Sw) * hp * wq) + (ky * p.Dh * wq) + (c / p.Sw);
-                        }
-                    }
+                int c = kx * p.Dw;
+                taps[t] = ((c % p.Sw) * hp * wq) + (ky * p.Dh * wq) + (c / p.Sw);
+            }
+        }
 
-                    Span<float> dst = output.AsSpan(plane * p.Oh * p.Ow, p.Oh * p.Ow);
-                    DepthwisePlane(pad, taps, weight.AsSpan(ch * p.Kh * p.Kw, p.Kh * p.Kw), bias is null ? 0f : bias[ch], p, wq, dst);
-                    if (!epilogue.IsEmpty)
+        void Plane(float[] pad, int ip, int j)
+        {
+            int m = ((ip % p.C) * mult) + j;
+            int o = ((ip / p.C) * p.M) + m;
+            Span<float> dst = output.AsSpan(o * outPlane, outPlane);
+            DepthwisePlane(pad, taps, weight.AsSpan(m * p.Kh * p.Kw, p.Kh * p.Kw), bias is null ? 0f : bias[m], p, wq, dst);
+            if (!epilogue.IsEmpty)
+            {
+                epilogue.Apply(dst, o * outPlane);
+            }
+        }
+
+        long work = (long)n * p.M * outPlane * p.Kh * p.Kw;
+        if (mult == 1 || inPlanes >= Parallelism.Workers)
+        {
+            Parallelism.For(inPlanes, work, (s, e) =>
+            {
+                float[] pad = System.Buffers.ArrayPool<float>.Shared.Rent(scratch);
+                for (int ip = s; ip < e; ip++)
+                {
+                    PadPhases(input.AsSpan(ip * p.H * p.W, p.H * p.W), p, hp, wq, pad);
+                    for (int j = 0; j < mult; j++)
                     {
-                        epilogue.Apply(dst, plane * p.Oh * p.Ow);
+                        Plane(pad, ip, j);
                     }
                 }
-            }
-            finally
-            {
+
                 System.Buffers.ArrayPool<float>.Shared.Return(pad);
-            }
-        });
+            });
+            return;
+        }
+
+        // Few input planes, many filters each (the stems): pad once, spread the filters.
+        float[] shared = System.Buffers.ArrayPool<float>.Shared.Rent(scratch);
+        for (int ip = 0; ip < inPlanes; ip++)
+        {
+            PadPhases(input.AsSpan(ip * p.H * p.W, p.H * p.W), p, hp, wq, shared);
+            Parallelism.For(mult, work / inPlanes, (s, e) =>
+            {
+                for (int j = s; j < e; j++)
+                {
+                    Plane(shared, ip, j);
+                }
+            });
+        }
+
+        System.Buffers.ArrayPool<float>.Shared.Return(shared);
     }
 
     /// <summary>Copies a plane into the zero-padded, phase-split layout <see cref="Depthwise"/> reads.</summary>
     private static void PadPhases(ReadOnlySpan<float> src, ConvParams p, int hp, int wq, float[] pad)
     {
-        Array.Clear(pad, 0, p.Sw * hp * wq);
-        for (int y = 0; y < hp; y++)
+        for (int q = 0; q < p.Sw; q++)
         {
-            int iy = y - p.Pt;
-            if ((uint)iy >= (uint)p.H)
-            {
-                continue;
-            }
-
-            ReadOnlySpan<float> row = src.Slice(iy * p.W, p.W);
-            if (p.Sw == 1)
-            {
-                // Padded column X holds input column X - Pl.
-                int x0 = Math.Max(0, p.Pl), from = Math.Max(0, -p.Pl);
-                int len = Math.Min(p.W - from, wq - 16 - x0);
-                if (len > 0)
-                {
-                    row.Slice(from, len).CopyTo(pad.AsSpan((y * wq) + x0, len));
-                }
-
-                continue;
-            }
-
-            for (int q = 0; q < p.Sw; q++)
+            // Phase q, column j holds padded column j·Sw + q, i.e. input column j·Sw + q - Pl.
+            int off = q - p.Pl;
+            int jlo = off >= 0 ? 0 : (-off + p.Sw - 1) / p.Sw;
+            int jhi = Math.Min(wq, ((p.W - 1 - off) / p.Sw) + 1);
+            for (int y = 0; y < hp; y++)
             {
                 Span<float> dst = pad.AsSpan((q * hp * wq) + (y * wq), wq);
-                for (int j = 0; j < wq - 16; j++)
+                int iy = y - p.Pt;
+                if ((uint)iy >= (uint)p.H || jhi <= jlo)
                 {
-                    int ix = (j * p.Sw) + q - p.Pl;
-                    if ((uint)ix < (uint)p.W)
+                    dst.Clear();
+                    continue;
+                }
+
+                dst[..jlo].Clear();
+                dst[jhi..].Clear();
+                ReadOnlySpan<float> row = src.Slice(iy * p.W, p.W);
+                if (p.Sw == 1)
+                {
+                    row.Slice(jlo + off, jhi - jlo).CopyTo(dst[jlo..]);
+                }
+                else if (p.Sw == 2)
+                {
+                    Deinterleave(row, (2 * jlo) + off, dst.Slice(jlo, jhi - jlo));
+                }
+                else
+                {
+                    for (int j = jlo; j < jhi; j++)
                     {
-                        dst[j] = row[ix];
+                        dst[j] = row[(j * p.Sw) + off];
                     }
                 }
             }
         }
     }
 
-    private static unsafe void DepthwisePlane(float[] pad, ReadOnlySpan<int> taps, ReadOnlySpan<float> w, float bias, ConvParams p, int wq, Span<float> dst)
+    /// <summary><c>dst[j] = src[start + 2j]</c>.</summary>
+    private static void Deinterleave(ReadOnlySpan<float> src, int start, Span<float> dst)
+    {
+        int j = 0;
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            for (; start + (2 * j) + 16 <= src.Length && j + 8 <= dst.Length; j += 8)
+            {
+                Vector256<float> a = Vector256.Create(src.Slice(start + (2 * j), 8));
+                Vector256<float> b = Vector256.Create(src.Slice(start + (2 * j) + 8, 8));
+                Vector256<float> even = System.Runtime.Intrinsics.X86.Avx.Shuffle(a, b, 0b10_00_10_00);
+                System.Runtime.Intrinsics.X86.Avx2.Permute4x64(even.AsDouble(), 0b11_01_10_00).AsSingle().CopyTo(dst.Slice(j, 8));
+            }
+        }
+
+        for (; j < dst.Length; j++)
+        {
+            dst[j] = src[start + (2 * j)];
+        }
+    }
+
+    private static unsafe void DepthwisePlane(float[] pad, int[] taps, ReadOnlySpan<float> w, float bias, ConvParams p, int wq, Span<float> dst)
     {
         int nt = taps.Length;
         fixed (float* src = pad)
@@ -472,36 +521,9 @@ internal static partial class Operators
             {
                 float* row = src + (oy * p.Sh * wq);
                 float* o = d + (oy * p.Ow);
-                int ox = 0;
-                if (Gemm.Wide)
-                {
-                    for (; ox + 16 <= p.Ow; ox += 16)
-                    {
-                        var acc = Vector512.Create(bias);
-                        float* r = row + ox;
-                        for (int t = 0; t < nt; t++)
-                        {
-                            acc = Vector512.FusedMultiplyAdd(Vector512.Load(r + tp[t]), Vector512.Create(wp[t]), acc);
-                        }
-
-                        acc.Store(o + ox);
-                    }
-                }
-                else if (Vector256.IsHardwareAccelerated)
-                {
-                    for (; ox + 8 <= p.Ow; ox += 8)
-                    {
-                        var acc = Vector256.Create(bias);
-                        float* r = row + ox;
-                        for (int t = 0; t < nt; t++)
-                        {
-                            acc = Vector256.FusedMultiplyAdd(Vector256.Load(r + tp[t]), Vector256.Create(wp[t]), acc);
-                        }
-
-                        acc.Store(o + ox);
-                    }
-                }
-
+                int ox = Gemm.Wide ? DepthwiseRow512(row, tp, wp, nt, bias, o, p.Ow)
+                    : Vector256.IsHardwareAccelerated ? DepthwiseRow256(row, tp, wp, nt, bias, o, p.Ow)
+                    : 0;
                 for (; ox < p.Ow; ox++)
                 {
                     float acc = bias;
@@ -515,6 +537,88 @@ internal static partial class Operators
                 }
             }
         }
+    }
+
+    /// <summary>One output row, 16 columns per vector; returns the first column not done.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    private static unsafe int DepthwiseRow512(float* row, int* tp, float* wp, int nt, float bias, float* o, int ow)
+    {
+        int ox = 0;
+        var b = Vector512.Create(bias);
+        for (; ox + 64 <= ow; ox += 64)
+        {
+            Vector512<float> a0 = b, a1 = b, a2 = b, a3 = b;
+            float* r = row + ox;
+            for (int t = 0; t < nt; t++)
+            {
+                float* q = r + tp[t];
+                var wv = Vector512.Create(wp[t]);
+                a0 = Vector512.FusedMultiplyAdd(Vector512.Load(q), wv, a0);
+                a1 = Vector512.FusedMultiplyAdd(Vector512.Load(q + 16), wv, a1);
+                a2 = Vector512.FusedMultiplyAdd(Vector512.Load(q + 32), wv, a2);
+                a3 = Vector512.FusedMultiplyAdd(Vector512.Load(q + 48), wv, a3);
+            }
+
+            a0.Store(o + ox);
+            a1.Store(o + ox + 16);
+            a2.Store(o + ox + 32);
+            a3.Store(o + ox + 48);
+        }
+
+        for (; ox + 16 <= ow; ox += 16)
+        {
+            Vector512<float> a0 = b;
+            float* r = row + ox;
+            for (int t = 0; t < nt; t++)
+            {
+                a0 = Vector512.FusedMultiplyAdd(Vector512.Load(r + tp[t]), Vector512.Create(wp[t]), a0);
+            }
+
+            a0.Store(o + ox);
+        }
+
+        return ox;
+    }
+
+    /// <summary>One output row, 8 columns per vector; returns the first column not done.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    private static unsafe int DepthwiseRow256(float* row, int* tp, float* wp, int nt, float bias, float* o, int ow)
+    {
+        int ox = 0;
+        var b = Vector256.Create(bias);
+        for (; ox + 32 <= ow; ox += 32)
+        {
+            Vector256<float> a0 = b, a1 = b, a2 = b, a3 = b;
+            float* r = row + ox;
+            for (int t = 0; t < nt; t++)
+            {
+                float* q = r + tp[t];
+                var wv = Vector256.Create(wp[t]);
+                a0 = Vector256.FusedMultiplyAdd(Vector256.Load(q), wv, a0);
+                a1 = Vector256.FusedMultiplyAdd(Vector256.Load(q + 8), wv, a1);
+                a2 = Vector256.FusedMultiplyAdd(Vector256.Load(q + 16), wv, a2);
+                a3 = Vector256.FusedMultiplyAdd(Vector256.Load(q + 24), wv, a3);
+            }
+
+            a0.Store(o + ox);
+            a1.Store(o + ox + 8);
+            a2.Store(o + ox + 16);
+            a3.Store(o + ox + 24);
+        }
+
+        for (; ox + 8 <= ow; ox += 8)
+        {
+            Vector256<float> a0 = b;
+            float* r = row + ox;
+            for (int t = 0; t < nt; t++)
+            {
+                a0 = Vector256.FusedMultiplyAdd(Vector256.Load(r + tp[t]), Vector256.Create(wp[t]), a0);
+            }
+
+            a0.Store(o + ox);
+        }
+
+        return ox;
     }
 
     internal static Tensor MatMul(Tensor a, Tensor b)
