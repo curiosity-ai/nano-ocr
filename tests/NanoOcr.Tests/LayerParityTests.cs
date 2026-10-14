@@ -73,7 +73,9 @@ public class LayerParityTests(ITestOutputHelper output)
 
     /// <summary>
     /// The fused graph (convolutions with their activation and residual folded in) produces exactly
-    /// the unfused graph's outputs: fusion moves work, it must not change arithmetic.
+    /// the unfused graph's outputs: fusion moves work, it must not change arithmetic. The one
+    /// exception is the CTC head's <c>SoftmaxPeak</c>, whose sum of exponentials adds the same
+    /// terms in another order: its float outputs agree within the layer tolerance, its ids exactly.
     /// </summary>
     [Theory]
     [MemberData(nameof(Models))]
@@ -94,10 +96,18 @@ public class LayerParityTests(ITestOutputHelper output)
         Tensor[] fused = session.Run(feed);
         Tensor[] plain = session.RunUnfused(feed);
         output.WriteLine($"{model}: {session.Nodes.Count} nodes, {session.FusedNodes.Count} after fusion");
+        bool reordered = session.FusedNodes.Any(n => n.OpType == "SoftmaxPeak");
         for (int o = 0; o < fused.Length; o++)
         {
             Assert.Equal(plain[o].Shape, fused[o].Shape);
-            Assert.True(plain[o].ToFloatArray().AsSpan().SequenceEqual(fused[o].ToFloatArray()), $"output {o} differs");
+            bool exact = plain[o].ToFloatArray().AsSpan().SequenceEqual(fused[o].ToFloatArray());
+            if (!exact && reordered && fused[o].Type == ElementType.Float)
+            {
+                Assert.Null(Compare(plain[o], fused[o], out _));
+                continue;
+            }
+
+            Assert.True(exact, $"output {o} differs");
         }
     }
 

@@ -77,7 +77,9 @@ internal static partial class Operators
 
     /// <summary>The kernel for <paramref name="node"/>, or <see langword="null"/> if unsupported.</summary>
     public static Kernel? Resolve(OnnxNode node) =>
-        node.Domain is "" or "ai.onnx" && Table.TryGetValue(node.OpType, out Kernel? k) ? k : null;
+        node.Domain is "" or "ai.onnx" && Table.TryGetValue(node.OpType, out Kernel? k) ? k
+        : node.Domain == FusedDomain && FusedTable.TryGetValue(node.OpType, out k) ? k
+        : null;
 
     /// <summary>Normalizes a possibly negative axis.</summary>
     internal static int Axis(long axis, int rank) => (int)(axis < 0 ? axis + rank : axis);

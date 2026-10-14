@@ -75,6 +75,26 @@ internal static class Py
             return n == 0 ? 0f : res;
         }
 
+        if (n <= 128 && System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            // numpy's eight accumulators are the eight lanes: lane j adds a[j], a[j+8], ... in
+            // order, exactly as r_j does, and the lanes then combine in numpy's tree.
+            var acc = System.Runtime.Intrinsics.Vector256.Create(a[..8]);
+            int i;
+            for (i = 8; i < n - (n % 8); i += 8)
+            {
+                acc += System.Runtime.Intrinsics.Vector256.Create(a.Slice(i, 8));
+            }
+
+            float res = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+            for (; i < n; i++)
+            {
+                res += a[i];
+            }
+
+            return res;
+        }
+
         if (n <= 128)
         {
             float r0 = a[0], r1 = a[1], r2 = a[2], r3 = a[3], r4 = a[4], r5 = a[5], r6 = a[6], r7 = a[7];

@@ -56,7 +56,7 @@ public sealed class InferenceSession
         }
 
         _graphOutputs = new HashSet<string>(_graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
-        _fusedNodes = Environment.GetEnvironmentVariable("NANOOCR_NO_FUSION") == "1" ? _nodes : Fuse(_nodes, _graphOutputs);
+        _fusedNodes = Environment.GetEnvironmentVariable("NANOOCR_NO_FUSION") == "1" ? _nodes : FuseSoftmaxPeak(Fuse(_nodes, _graphOutputs), _graphOutputs, _constants);
         _fusedKernels = _fusedNodes.Select(n => Operators.Resolve(n)!).ToArray();
         _plan = new Lazy<Plan>(() => BuildPlan(_nodes));
         _fusedPlan = new Lazy<Plan>(() => BuildPlan(_fusedNodes));
@@ -425,6 +425,125 @@ public sealed class InferenceSession
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Replaces the CTC head's tail — <c>Y = Transpose(X, [0,2,1])</c> read by <c>ReduceMax(Y, -1)</c>,
+    /// <c>ArgMax(Y, -1)</c> and <c>Sub(Y, Unsqueeze(max, -1)) → Exp → ReduceSum(-1)</c>, all without
+    /// kept dimensions — with one <c>SoftmaxPeak</c> over <c>X</c> (see <c>Operators.SoftmaxPeak</c>)
+    /// that yields the max, the arg-max and the sum of exponentials.
+    /// </summary>
+    private static List<OnnxNode> FuseSoftmaxPeak(List<OnnxNode> nodes, HashSet<string> graphOutputs, Dictionary<string, Tensor> constants)
+    {
+        var readers = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            foreach (string input in nodes[i].Inputs)
+            {
+                if (input.Length > 0)
+                {
+                    (readers.TryGetValue(input, out var l) ? l : readers[input] = []).Add(i);
+                }
+            }
+        }
+
+        List<int> Readers(string v) => readers.TryGetValue(v, out var l) ? l : [];
+        bool Private(string v) => !graphOutputs.Contains(v);
+        bool LastAxis(OnnxNode n, int inputIndex, string attr)
+        {
+            long[]? axes = n.Inputs.Count > inputIndex && n.Inputs[inputIndex].Length > 0
+                ? constants.TryGetValue(n.Inputs[inputIndex], out Tensor? c) ? c.ToLongArray() : null
+                : n.Ints(attr);
+            return axes is [-1] or [2];
+        }
+
+        bool NoKeep(OnnxNode n) => n.Int("keepdims", 1) == 0;
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            OnnxNode tr = nodes[i];
+            if (tr.OpType != "Transpose" || tr.Ints("perm") is not [0, 2, 1] || !Private(tr.Outputs[0]))
+            {
+                continue;
+            }
+
+            string y = tr.Outputs[0];
+            List<int> ys = Readers(y);
+            if (ys.Count != 3)
+            {
+                continue;
+            }
+
+            OnnxNode? rmax = null, amax = null, sub = null;
+            foreach (int r in ys)
+            {
+                OnnxNode n = nodes[r];
+                if (n.OpType == "ReduceMax" && n.Inputs[0] == y && NoKeep(n) && LastAxis(n, 1, "axes"))
+                {
+                    rmax = n;
+                }
+                else if (n.OpType == "ArgMax" && n.Inputs[0] == y && NoKeep(n) && n.Int("axis", 0) is -1 or 2 && n.Int("select_last_index", 0) == 0)
+                {
+                    amax = n;
+                }
+                else if (n.OpType == "Sub" && n.Inputs[0] == y && n.Inputs[1] != y)
+                {
+                    sub = n;
+                }
+            }
+
+            if (rmax is null || amax is null || sub is null)
+            {
+                continue;
+            }
+
+            int ui = nodes.FindIndex(n => n.Outputs.Count == 1 && n.Outputs[0] == sub.Inputs[1]);
+            if (ui < 0 || nodes[ui].OpType != "Unsqueeze" || nodes[ui].Inputs[0] != rmax.Outputs[0] || !LastAxis(nodes[ui], 1, "axes")
+                || Readers(nodes[ui].Outputs[0]).Count != 1 || !Private(nodes[ui].Outputs[0]))
+            {
+                continue;
+            }
+
+            List<int> subReaders = Readers(sub.Outputs[0]);
+            if (subReaders.Count != 1 || !Private(sub.Outputs[0]) || nodes[subReaders[0]].OpType != "Exp")
+            {
+                continue;
+            }
+
+            OnnxNode exp = nodes[subReaders[0]];
+            List<int> expReaders = Readers(exp.Outputs[0]);
+            if (expReaders.Count != 1 || !Private(exp.Outputs[0]))
+            {
+                continue;
+            }
+
+            OnnxNode rsum = nodes[expReaders[0]];
+            if (rsum.OpType != "ReduceSum" || !NoKeep(rsum) || !LastAxis(rsum, 1, "axes"))
+            {
+                continue;
+            }
+
+            var fused = new OnnxNode { Name = tr.Name + "/SoftmaxPeak", OpType = "SoftmaxPeak", Domain = Operators.FusedDomain };
+            fused.Inputs.Add(tr.Inputs[0]);
+            fused.Outputs.AddRange([rmax.Outputs[0], amax.Outputs[0], rsum.Outputs[0]]);
+            var gone = new HashSet<OnnxNode>([tr, rmax, amax, sub, nodes[ui], exp, rsum]);
+            int at = gone.Max(n => nodes.IndexOf(n));
+            var result = new List<OnnxNode>(nodes.Count);
+            for (int k = 0; k < nodes.Count; k++)
+            {
+                if (k == at)
+                {
+                    result.Add(fused);
+                }
+                else if (!gone.Contains(nodes[k]))
+                {
+                    result.Add(nodes[k]);
+                }
+            }
+
+            return result;
+        }
+
+        return nodes;
     }
 
     /// <summary>Runs the graph with inputs given in <see cref="InputNames"/> order.</summary>
