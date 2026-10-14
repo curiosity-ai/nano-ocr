@@ -123,7 +123,7 @@ and 165 at 512, DRAM ~11 GB/s, jitter 12-50% — 1700×2200 page (`page_two_colu
 | | C# before this work | C# now | Python + ORT 1.31 |
 | --- | --- | --- | --- |
 | page, 1 thread | 452-510 ms | **214-230 ms** | 281-290 ms |
-| page, 4 threads | 297-326 ms | **157-168 ms** | 277-327 ms |
+| page, 4 threads | 297-326 ms | **157-168 ms**, then **106-128 ms** (below) | 277-327 ms |
 | allocation per warm page | 37 MiB, GC every page | **8 MiB, no GC** | — |
 
 Stage by stage, 1 thread: orientation + deskew 98-102 → 41-44 ms, detection 112-116 → 54-57,
@@ -136,7 +136,42 @@ against OpenCV, every line, token and markdown identical. The CLI's markdown for
 `tests/data/documents` (images, PDFs, TIFFs, with and without `--math`) is byte-identical between
 the build before this work and now.
 
-### What moved it
+### Multi-threaded
+
+This VM's four vCPUs together sustain only ~2.2-2.8× the single-thread FMA rate (the machine
+header's "all threads" figure), so that is the ceiling for any stage. Before this round, at 4
+threads, detection scaled 1.9× and orientation 2.2×, but recognition 1.15× (115 → ~96-100 ms): its
+seven width batches ran one after another, and each spread ~80 small operators over every
+thread — the small batches gained nothing and the big ones ~1.8×. Measured interleaved against
+`main` in one sitting, 1700×2200 page, best of 7:
+
+| | `main` | now |
+| --- | --- | --- |
+| page, 4 threads | 138-157 ms | **106-128 ms** |
+| page, 1 thread | 210-223 ms | 209-219 ms (unchanged, as intended) |
+| recognition, 4 threads | 84-100 ms | 47-57 ms |
+| cold CLI run, one page | 1.15-1.21 s | 0.94-1.05 s |
+
+What moved it (outputs unchanged: the CLI's markdown for all 24 test files at 1 and 4 cores, with
+and without `--math`, is byte-identical to `main`):
+
+- **`Parallelism.Jobs`**: independent jobs of different sizes run at once, largest first, up to
+  `Workers` at a time, each with a kernel degree proportional to its share of the work (at least
+  one). The recognizers' and the script model's width batches use it, so one dominant batch still
+  gets every thread and many similar ones get one each. Line crops run in parallel too. Inside a
+  batch every kernel computes the same chains whichever thread runs it.
+- **Orientation and deskew overlap**: with more than one worker, the skew is estimated on the page
+  as given while the orientation model runs; a page the model turns is deskewed again after the
+  turn (same result either way). Upright pages: orientation + deskew 20-22 → ~18 ms at 4 threads;
+  a turned page pays for the discarded estimate.
+- **JIT for the CLI**: tiering on, `TieredCompilationQuickJitForLoops=false` (every kernel has
+  loops, so it is optimised from its first call), `TieredPGO=false`. The loop-free rest starts
+  cheap. Cold page ~15% faster, warm throughput the same at 1 and 4 threads.
+
+Many pages (`PredictMany`, one page per core) are bound by the cold start; twelve pages on four
+cores measured 2.0-2.2 s against 2.1-2.5 s for `main`.
+
+### What moved it (single thread)
 
 In the order they landed; each is its own commit with its measurement.
 
@@ -191,8 +226,8 @@ folding.
 
 - **ReadyToRun for the CLI.** One page 1.49-1.52 s against 1.63-1.75 s JIT, but twelve pages
   4.05-4.40 s against 3.70-4.01 s, interleaved: the precompiled code targets a baseline ISA and the
-  hot kernels re-JIT anyway. Kept: JIT with `TieredCompilation=false` (tiering on was worse still:
-  4.6-5.1 s).
+  hot kernels re-JIT anyway. Kept: JIT (then with `TieredCompilation=false`; tiering with its
+  defaults was worse still, 4.6-5.1 s — now tiering with loops optimised up front, see above).
 - **A pointer-based scalar warp** (no bounds checks) instead of the AVX2 gathers: 222-235 ms
   against 97-123 ms for the gathers, single-threaded, interleaved — no better than the checked
   scalar loop (218-221 ms). The scalar per-pixel cost is in the float→int conversions and
@@ -219,6 +254,12 @@ folding.
 - **Banding the multi-filter stem depthwise** (all sixteen filters over a band of rows before the
   next): neutral (5.5 → 5.1 ms). The stem is bound by writing its 13 MB output, not by reading its
   input. Kept as harmless.
+- **Rounding `Parallelism.Jobs` shares up** (`ceiling` instead of `round`, so the second-largest
+  batch gets two threads rather than one): recognition 47-58 ms against 44-56, no separation in
+  three interleaved rounds. Kept `round`, which oversubscribes less.
+- **Smaller late layers of the orientation model** still scale poorly (17.8 → 13.4 ms at 4
+  threads): at 96×96 and 48×48 the parallel regions cost about what they save. Overlapping the
+  model with the deskew estimate was the better use of the threads.
 - **A cache-blocked quarter turn** with pointer writes: 5.9 → 5.1 ms — mostly the 3.7 MB result's
   allocation and first touch. Kept, small.
 

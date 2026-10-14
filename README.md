@@ -136,15 +136,17 @@ samples are normal on this machine):
 | | Python + ONNX Runtime 1.31 | C# |
 | --- | --- | --- |
 | one page, 1 thread | 281-290 ms | 214-230 ms |
-| one page, 4 threads | 277-327 ms | 157-168 ms |
+| one page, 4 threads | 277-327 ms | 106-128 ms |
 | allocation per warm page | — | 8 MiB, no GC |
 
-The C# figures are about twice as fast as this port was before its optimisation pass (452-510 ms
-on one thread, 297-326 on four, same sitting): 512-bit GEMM kernels, graph fusion (activation,
+The C# figures are two to three times as fast as this port was before its optimisation passes
+(452-510 ms on one thread, 297-326 on four, same sitting). Single-threaded: 512-bit GEMM kernels, graph fusion (activation,
 residual, squeeze-excite gate and sequence mask folded into the convolutions; the CTC head's
 softmax peak fused with its convolution), rewritten depthwise and pooling kernels, a deskew search
 that skips what it can prove is blank, vectorized OpenCV ports, and pooled buffers — with every
-model output, image byte and markdown line unchanged. `nano-ocr bench page.png --threads 1` prints
+model output, image byte and markdown line unchanged. Multi-threaded, the recognizer's width
+batches run concurrently with thread shares proportional to their size, and the deskew estimate
+overlaps the orientation model. `nano-ocr bench page.png --threads 1` prints
 a machine header (CPU, ISA, FMA and bandwidth ceilings, jitter) before its stage timings. Details,
 and the experiments that did not pay, are in [`CLAUDE.md`](CLAUDE.md).
 
