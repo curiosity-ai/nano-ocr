@@ -950,8 +950,10 @@ internal static partial class Operators
         int n = input.Shape[0], c = input.Shape[1], h = input.Shape[2], w = input.Shape[3];
         int kh = (int)kernel[0], kw = (int)kernel[1], sh = (int)strides[0], sw = (int)strides[1];
         int pt = (int)pads[0], pl = (int)pads[1], pb = (int)pads[2], pr = (int)pads[3];
-        int oh = ceil ? (int)Math.Ceiling((h + pt + pb - kh) / (double)sh) + 1 : ((h + pt + pb - kh) / sh) + 1;
-        int ow = ceil ? (int)Math.Ceiling((w + pl + pr - kw) / (double)sw) + 1 : ((w + pl + pr - kw) / sw) + 1;
+        // ONNX's floor (or ceil) of a quotient that is negative when the window is larger than the
+        // padded input: C#'s truncating division would make a one-column input pool to one column.
+        int oh = Math.Max(0, (int)(ceil ? Math.Ceiling((h + pt + pb - kh) / (double)sh) : Math.Floor((h + pt + pb - kh) / (double)sh)) + 1);
+        int ow = Math.Max(0, (int)(ceil ? Math.Ceiling((w + pl + pr - kw) / (double)sw) : Math.Floor((w + pl + pr - kw) / (double)sw)) + 1);
         Tensor result = Tensor.Float([n, c, oh, ow]);
         float[] src = input.FloatArray, dst = result.FloatArray;
         if (kh == 2 && kw == 2 && sh == 2 && sw == 2 && pt == 0 && pl == 0 && pb == 0 && pr == 0 && !ceil)

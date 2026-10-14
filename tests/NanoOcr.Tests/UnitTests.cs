@@ -317,6 +317,23 @@ public class UnitTests
     }
 
     [Fact]
+    public void PoolingAWindowWiderThanTheInputGivesNoColumns()
+    {
+        // ONNX floors (1 - 2) / 2 + 1 to 0; truncating division made it 1 and read past the row
+        // (the script model on a one-column-wide crop, RVL-CDIP test page 00_0019).
+        var node = new NanoOcr.Onnx.OnnxNode { OpType = "MaxPool" };
+        var kernel = new NanoOcr.Onnx.OnnxAttribute { Name = "kernel_shape" };
+        kernel.Ints.AddRange([2, 2]);
+        var strides = new NanoOcr.Onnx.OnnxAttribute { Name = "strides" };
+        strides.Ints.AddRange([2, 2]);
+        node.Attributes["kernel_shape"] = kernel;
+        node.Attributes["strides"] = strides;
+        var input = NanoOcr.Onnx.Tensor.Float([1, 3, 2, 1], clear: true);
+        NanoOcr.Onnx.Tensor output = NanoOcr.Onnx.Operators.Pool(node, input, max: true);
+        Assert.Equal([1, 3, 1, 0], output.Shape);
+    }
+
+    [Fact]
     public void UnrotateBoxMapsADeskewedBoxBack()
     {
         var page = new GrayImage(600, 400);
