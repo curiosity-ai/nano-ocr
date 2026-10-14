@@ -344,6 +344,15 @@ public sealed class InferenceSession
         }
 
         static bool Default(OnnxNode n) => n.Domain is "" or "ai.onnx";
+        var producer = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            foreach (string o in nodes[i].Outputs)
+            {
+                producer[o] = i;
+            }
+        }
+
         var removed = new bool[nodes.Count];
         var replacement = new OnnxNode?[nodes.Count];
         for (int i = 0; i < nodes.Count; i++)
@@ -356,8 +365,22 @@ public sealed class InferenceSession
 
             string value = conv.Outputs[0];
             int at = i;
-            string? residual = null;
+            string? residual = null, gate = null, mask = null, input = conv.Inputs[0];
             string act = "";
+
+            // Input side: Mul(x, sigmoid(...)) read only by this convolution — a squeeze-excite
+            // gate, applied per input channel while the product packs its input.
+            if (producer.TryGetValue(input, out int gi) && !removed[gi] && nodes[gi] is { OpType: "Mul" } mul && Default(mul)
+                && mul.Inputs.Count == 2 && SoleReader(input, out int gr) && gr == i)
+            {
+                int side = Array.FindIndex([.. mul.Inputs], v => producer.TryGetValue(v, out int pi) && nodes[pi].OpType == "Sigmoid");
+                if (side >= 0 && mul.Inputs[0] != mul.Inputs[1])
+                {
+                    gate = mul.Inputs[side];
+                    input = mul.Inputs[1 - side];
+                    removed[gi] = true;
+                }
+            }
             if (SoleReader(value, out int j) && !removed[j] && nodes[j].OpType == "Add" && Default(nodes[j]) && nodes[j].Inputs.Count == 2
                 && nodes[j].Inputs[0] != nodes[j].Inputs[1])
             {
@@ -373,21 +396,37 @@ public sealed class InferenceSession
                 at = j;
             }
 
-            if (at == i)
+            // Output side: Mul(y, mask) — a sequence mask, applied as each stretch is finished.
+            if (act != "Sigmoid" && SoleReader(value, out j) && !removed[j] && nodes[j].OpType == "Mul" && Default(nodes[j])
+                && nodes[j].Inputs.Count == 2 && nodes[j].Inputs[0] != nodes[j].Inputs[1])
+            {
+                mask = nodes[j].Inputs[0] == value ? nodes[j].Inputs[1] : nodes[j].Inputs[0];
+                removed[at] = at != i || removed[at];
+                value = nodes[j].Outputs[0];
+                at = j;
+            }
+
+            if (at == i && gate is null)
             {
                 continue;
             }
 
             var fused = new OnnxNode { Name = conv.Name, OpType = "Conv", Domain = conv.Domain };
-            fused.Inputs.AddRange(conv.Inputs);
-            if (residual is not null)
+            fused.Inputs.Add(input);
+            fused.Inputs.AddRange(conv.Inputs.Skip(1));
+            string?[] extra = [residual, gate, mask];
+            int last = Array.FindLastIndex(extra, e => e is not null);
+            if (last >= 0)
             {
                 while (fused.Inputs.Count < 3)
                 {
                     fused.Inputs.Add("");
                 }
 
-                fused.Inputs.Add(residual);
+                for (int e = 0; e <= last; e++)
+                {
+                    fused.Inputs.Add(extra[e] ?? "");
+                }
             }
 
             fused.Outputs.Add(value);

@@ -13,6 +13,8 @@ internal static partial class Operators
         Tensor input = x[0]!, weight = x[1]!;
         Tensor? bias = x.Count > 2 ? x[2] : null;
         Tensor? residual = x.Count > 3 ? x[3] : null;
+        Tensor? gate = x.Count > 4 ? x[4] : null;
+        Tensor? mask = x.Count > 5 ? x[5] : null;
         string act = node.Str(FusedActivation, "");
         if (input.Rank == 3)
         {
@@ -37,15 +39,24 @@ internal static partial class Operators
             a = new OnnxAttribute { Name = "pads" };
             a.Ints.AddRange([0, pd[0], 0, pd[1]]);
             attrs.Attributes["pads"] = a;
-            Tensor? res2 = residual?.Rank == 3 ? residual.Reshape([residual.Shape[0], residual.Shape[1], 1, residual.Shape[2]]) : residual;
-            Tensor out2 = Conv(attrs, res2 is null ? [in2, w2, bias] : [in2, w2, bias, res2]);
+            // The fused inputs (residual, gate, mask) follow the input into 2-D.
+            var args = new List<Tensor?>(x.Count) { in2, w2, bias };
+            for (int i = 3; i < x.Count; i++)
+            {
+                args.Add(x[i]?.Rank == 3 ? x[i]!.Reshape([x[i]!.Shape[0], x[i]!.Shape[1], 1, x[i]!.Shape[2]]) : x[i]);
+            }
+
+            Tensor out2 = Conv(attrs, args);
             Tensor out1 = out2.Reshape([out2.Shape[0], out2.Shape[1], out2.Shape[3]]);
             in2.Release();
             w2.Release();
             out2.Release();
-            if (res2 is not null && !ReferenceEquals(res2, residual))
+            for (int i = 3; i < x.Count; i++)
             {
-                res2.Release();
+                if (args[i] is not null && !ReferenceEquals(args[i], x[i]))
+                {
+                    args[i]!.Release();
+                }
             }
 
             return out1;
@@ -82,18 +93,34 @@ internal static partial class Operators
         var p = new ConvParams(c, h, w, m, cg, kh, kw, sh, sw, dh, dw, pt, pl, oh, ow, group);
         float[]? b = bias?.FloatArray;
 
-        // A residual of another shape (a broadcast) is added after the convolution instead.
+        // Whatever has a shape the fused paths do not cover is applied as the unfused node
+        // would have, before or after: a broadcast residual, a gate that is not [N, C, 1, 1] or
+        // whose convolution does not take the batched pointwise path, a mask that is not
+        // [N, 1, Oh, Ow] (or that would follow an unfused step or the whole-tensor sigmoid).
         bool fuseResidual = residual is not null && residual.Type == ElementType.Float && residual.Shape.AsSpan().SequenceEqual(output.Shape);
-        var epilogue = new Epilogue(fuseResidual ? residual!.FloatArray : null, ParseActivation(residual is null || fuseResidual ? act : ""));
+        bool fuseGate = gate is not null && gate.Type == ElementType.Float && gate.Shape.AsSpan().SequenceEqual([n, c, 1, 1])
+            && UsesPointwiseBatched(p, n);
+        Activation activation = ParseActivation(residual is null || fuseResidual ? act : "");
+        bool fuseMask = mask is not null && mask.Type == ElementType.Float && mask.Shape.AsSpan().SequenceEqual([n, 1, oh, ow])
+            && (residual is null || fuseResidual) && activation != Activation.Sigmoid;
+        Tensor? gated = null;
+        if (gate is not null && !fuseGate)
+        {
+            gated = Binary(input, gate, BinaryOp.Mul);
+            input = gated;
+        }
+
+        var epilogue = new Epilogue(fuseResidual ? residual!.FloatArray : null, activation, fuseMask ? mask!.FloatArray : null, m, oh * ow);
         if (group == c && cg == 1 && m % c == 0 && (m == c || kh * kw <= 25))
         {
             Depthwise(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p, epilogue);
         }
         else
         {
-            GroupedGemm(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p, epilogue);
+            GroupedGemm(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p, epilogue, fuseGate ? gate!.FloatArray : null);
         }
 
+        gated?.Release();
         epilogue.ApplyWhole(output.FloatArray, output.Length);
         if (residual is not null && !fuseResidual)
         {
@@ -108,13 +135,27 @@ internal static partial class Operators
             }
         }
 
+        if (mask is not null && !fuseMask)
+        {
+            Tensor masked = Binary(output, mask, BinaryOp.Mul);
+            output.Release();
+            output = masked;
+        }
+
         return output;
     }
 
+    /// <summary>Whether <see cref="GroupedGemm"/> will run this convolution as <see cref="PointwiseBatched"/> on the segmented GEMM.</summary>
+    private static bool UsesPointwiseBatched(ConvParams p, int n) =>
+        Gemm.Wide && p.Group == 1 && n > 1 && p.Oh * p.Ow < 1024
+        && p.Kh == 1 && p.Kw == 1 && p.Sh == 1 && p.Sw == 1 && p.Pt == 0 && p.Pl == 0 && p.Oh == p.H && p.Ow == p.W;
+
     /// <summary>
     /// The attribute <see cref="InferenceSession"/>'s fusion pass puts on a Conv that absorbed the
-    /// activation after it: <c>HardSwish</c>, <c>Relu</c> or <c>Sigmoid</c>. A fourth input is a
-    /// residual absorbed from an <c>Add</c>, added before the activation.
+    /// activation after it: <c>HardSwish</c>, <c>Relu</c> or <c>Sigmoid</c>. Inputs past the
+    /// bias are absorbed element-wise nodes: [3] a residual from an <c>Add</c>, added before the
+    /// activation; [4] a gate <c>[N, C, 1]</c> from a <c>Mul</c> on the input; [5] a mask
+    /// <c>[N, 1, T]</c> from a <c>Mul</c> on the output, applied last.
     /// </summary>
     internal const string FusedActivation = "nanoocr.activation";
 
@@ -134,9 +175,9 @@ internal static partial class Operators
     /// stretch is still in cache: add the residual, then apply the activation — the same
     /// operations, in the same order, as the <c>Add</c> and activation nodes it replaced.
     /// </summary>
-    internal readonly record struct Epilogue(float[]? Residual, Activation Act)
+    internal readonly record struct Epilogue(float[]? Residual, Activation Act, float[]? Mask = null, int Channels = 0, int Pixels = 0)
     {
-        public bool IsEmpty => Residual is null && Act == Activation.None;
+        public bool IsEmpty => Residual is null && Act == Activation.None && Mask is null;
 
         /// <summary>Applies the epilogue to <paramref name="dst"/>, which starts at <paramref name="offset"/> of the output.</summary>
         public void Apply(Span<float> dst, int offset)
@@ -150,6 +191,13 @@ internal static partial class Operators
             {
                 case Activation.HardSwish: Activations.HardSwish(dst, dst); break;
                 case Activation.Relu: TensorPrimitives.Max(dst, 0f, dst); break;
+            }
+
+            if (Mask is not null)
+            {
+                // A stretch never crosses an output row; the mask is [N, 1, pixels].
+                int item = offset / (Channels * Pixels), at = offset % Pixels;
+                TensorPrimitives.Multiply(dst, Mask.AsSpan((item * Pixels) + at, dst.Length), dst);
             }
         }
 
@@ -174,7 +222,7 @@ internal static partial class Operators
     /// Convolution as im2col + GEMM, tiled over output pixels so each worker's column buffer stays
     /// cache-sized. A 1×1, stride-1, unpadded convolution reads its input in place.
     /// </summary>
-    private static void GroupedGemm(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
+    private static void GroupedGemm(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue, float[]? gate = null)
     {
         int mg = p.M / p.Group;
         int k = p.Cg * p.Kh * p.Kw;
@@ -223,7 +271,7 @@ internal static partial class Operators
 
         if (pointwise && p.Group == 1 && n > 1 && pixels < 1024)
         {
-            PointwiseBatched(input, weight, bias, output, n, p, epilogue);
+            PointwiseBatched(input, weight, bias, output, n, p, epilogue, gate);
             return;
         }
 
@@ -272,14 +320,14 @@ internal static partial class Operators
     /// and unpacked. Per item the product would be 128 columns wide with a scalar tail; packed it is
     /// thousands wide and splits across every core.
     /// </summary>
-    private static void PointwiseBatched(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
+    private static void PointwiseBatched(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue, float[]? gate = null)
     {
         int t = p.H * p.W, c = p.C, m = p.M, cols = n * t;
         if (Gemm.Wide)
         {
             // The product reads the items in place and writes them in place; then bias and
             // epilogue per output row, the same Σ + bias as the packed path below.
-            Gemm.MultiplyBatched(m, t, n, c, weight, c, input, (long)c * t, output, (long)m * t);
+            Gemm.MultiplyBatched(m, t, n, c, weight, c, input, (long)c * t, output, (long)m * t, rowScale: gate is null ? default : gate.AsSpan(0, n * c));
             Parallelism.For(n, (long)m * cols, (b0, b1) =>
             {
                 for (int b = b0; b < b1; b++)

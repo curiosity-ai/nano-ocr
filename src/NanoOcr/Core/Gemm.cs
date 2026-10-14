@@ -78,7 +78,12 @@ public static unsafe class Gemm
     /// Each output is the same in-order FMA chain as <see cref="Multiply"/> computes. Requires the
     /// 512-bit kernels (<see cref="Wide"/>).
     /// </summary>
-    public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride, bool accumulate = false)
+    /// <param name="rowScale">
+    /// Optional, <c>batch·k</c> long: row p of <c>B_i</c> is read as <c>B_i[p, ·] · rowScale[i·k + p]</c>
+    /// (one rounded multiply per element, applied while packing) — a per-item, per-channel gate on
+    /// the convolution's input, such as a squeeze-excite output, without a pass over the input.
+    /// </param>
+    public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride, bool accumulate = false, ReadOnlySpan<float> rowScale = default)
     {
         if (!Wide)
         {
@@ -93,15 +98,27 @@ public static unsafe class Gemm
         fixed (float* pa = a)
         fixed (float* pb = b)
         fixed (float* pc = c)
+        fixed (float* ps = rowScale)
         {
-            Run(pa, lda, pb, t, pc, t, m, t * batch, k, accumulate, new Segments(t, bStride, cStride));
+            Run(pa, lda, pb, t, pc, t, m, t * batch, k, accumulate, new Segments(t, bStride, cStride, rowScale.IsEmpty ? 0 : (nint)ps, k));
         }
     }
 
     /// <summary>How logical columns map to memory: <see cref="Len"/> columns per item, items <see cref="BStride"/> / <see cref="CStride"/> apart.</summary>
-    private readonly record struct Segments(int Len, long BStride, long CStride)
+    private readonly struct Segments(int len, long bStride, long cStride, nint scale = 0, int scaleStride = 0)
     {
         public static readonly Segments None = new(int.MaxValue, 0, 0);
+
+        public int Len { get; } = len;
+
+        public long BStride { get; } = bStride;
+
+        public long CStride { get; } = cStride;
+
+        /// <summary>Optional <c>float*</c>: row p of item i's B is multiplied by <c>Scale[i·ScaleStride + p]</c> as it is packed.</summary>
+        public nint Scale { get; } = scale;
+
+        public int ScaleStride { get; } = scaleStride;
 
         public bool IsNone => Len == int.MaxValue;
 
@@ -406,7 +423,7 @@ public static unsafe class Gemm
                         }
                         else
                         {
-                            PackSegments(b + (kb * (long)ldb), ldb, jb, je, kc, nr, packed, seg);
+                            PackSegments(b + (kb * (long)ldb), ldb, jb, je, kb, kc, nr, packed, seg);
                         }
 
                         for (int s = 0; s < strips; s++)
@@ -520,7 +537,7 @@ public static unsafe class Gemm
     }
 
     /// <summary><see cref="Pack"/> for columns laid out in items (<see cref="Segments"/>).</summary>
-    private static void PackSegments(float* b, int ldb, int jb, int je, int kc, int nr, float* packed, Segments seg)
+    private static void PackSegments(float* b, int ldb, int jb, int je, int kb, int kc, int nr, float* packed, Segments seg)
     {
         int strips = (je - jb + nr - 1) / nr;
         for (int s = 0; s < strips; s++)
@@ -544,9 +561,21 @@ public static unsafe class Gemm
                 int j = js + q0;
                 int run = Math.Min(width - q0, seg.Len - (j % seg.Len));
                 float* src = b + seg.B(j);
-                for (int p = 0; p < kc; p++)
+                if (seg.Scale == 0)
                 {
-                    Buffer.MemoryCopy(src + (p * (long)ldb), dst + (p * nr) + q0, run * sizeof(float), run * sizeof(float));
+                    for (int p = 0; p < kc; p++)
+                    {
+                        Buffer.MemoryCopy(src + (p * (long)ldb), dst + (p * nr) + q0, run * sizeof(float), run * sizeof(float));
+                    }
+                }
+                else
+                {
+                    float* scale = (float*)seg.Scale + ((long)(j / seg.Len) * seg.ScaleStride) + kb;
+                    for (int p = 0; p < kc; p++)
+                    {
+                        System.Numerics.Tensors.TensorPrimitives.Multiply(
+                            new ReadOnlySpan<float>(src + (p * (long)ldb), run), scale[p], new Span<float>(dst + (p * nr) + q0, run));
+                    }
                 }
 
                 q0 += run;
