@@ -15,8 +15,8 @@ namespace NanoOcr.Tests;
 /// </summary>
 public class PipelineParityTests(ITestOutputHelper output)
 {
-    private static readonly Lazy<NanoOcrEngine> Engine = new(() => new NanoOcrEngine());
-    private static readonly Lazy<NanoOcrEngine> MathEngine = new(() => new NanoOcrEngine(new EngineOptions { Math = true }));
+    private static readonly Lazy<NanoOcrEngine> Engine = new(() => new NanoOcrEngine(new EngineOptions { Markdown = MarkdownOptions.Reference }));
+    private static readonly Lazy<NanoOcrEngine> MathEngine = new(() => new NanoOcrEngine(new EngineOptions { Math = true, Markdown = MarkdownOptions.Reference }));
 
     public static TheoryData<string> Images => ["page_two_column", "page_rotated", "page_skewed", "page_chinese", "page_math"];
 

@@ -73,6 +73,7 @@ foreach (var (path, pages, error) in ocr.PredictMany(files, cores: 8))
 | `ModelDir` | embedded | a folder laid out like the Hugging Face repository instead |
 | `KeepImages` | false | keep page images on the results (for `SaveToImg`) |
 | `Fusion` | true | run the models with element-wise nodes fused into the convolutions; false runs the graphs as written (same results, slower) |
+| `Markdown` | `MarkdownOptions.Default` | the markdown flavour and the document-level passes (see [Markdown](#markdown)) |
 
 Everything is configured in code (or, for `nano-ocr`, with command-line arguments: `nano-ocr --help`);
 nothing reads environment variables.
@@ -94,6 +95,8 @@ nano-ocr paper.pdf --math                # write math as LaTeX
 nano-ocr scan.png --no-orientation       # the page is known to be upright
 nano-ocr scan.png --no-fusion --gemm-256 # graphs as written, 256-bit kernels (A/B; same output)
 nano-ocr scan.png --save-img out/        # draw blocks and lines over the page
+nano-ocr paper.pdf --merge-tables --title-levels   # rejoin split tables, heading depth from the document
+nano-ocr paper.pdf --md-style reference  # the Python original's markdown, byte for byte
 nano-ocr bench page.png                  # warm stage timings, per-operator profile
 ```
 
@@ -104,6 +107,39 @@ Each page (`OcrResult.Page`) has `Lines` (box, text, confidence, in reading orde
 `Footnote`, `Table-Of-Contents`, `Form`), `Markdown` (headings, paragraphs, lists, tables as HTML),
 `Source` (`ocr`, `text`, `hybrid` or `error`), `Rotation`, `Skew`, `Timings` and `Note` — the
 fields of the Python `Page`, and `ToJson()` writes the Python CLI's JSON layout.
+
+### Markdown
+
+By default the markdown is written the way PaddleOCR's document parser writes it (PaddleX's
+`MarkdownConverter`, as [PaddleOcrSharp](https://github.com/curiosity-ai/PaddleOCR/tree/main/dotnet)
+reproduces it), so the output of the two engines can be consumed the same way:
+
+| | PaddleOCR style (default) | `--md-style reference` (the Python original) |
+| --- | --- | --- |
+| document title | `# Title` — the opening heading of the first page, when its text is ≥1.25× every other heading's | `## Title` |
+| headings | depth from the numbering: `## Results`, `### 1. Introduction`, `#### 1.2.3 Detail` | `## ` always |
+| tables | one line of HTML, every cell `<td>`, border and centring styles, after an empty line | `<table>`, one `<tr>` per line, header row in `<th>` |
+| lists | items separated by a blank line | one item per line |
+| captions | centred in a `<div>` | plain paragraph |
+
+On the test corpus (`page_two_column.png`, `scanned.pdf`, `digital.pdf`, …) the default output is
+byte-identical to PaddleOCR-VL 1.6's wherever the two read the same text. Two things stay NanoOCR's
+own because they are content rather than format: inline math is `$…$` (PaddleOCR pads it to
+`␣$ … $`, which not every renderer reads as math), and what each model reads.
+
+`MarkdownOptions` (and the CLI flags) also carry PaddleOCR's document-level passes, ported onto
+NanoOCR's layout blocks:
+
+| Option | CLI | |
+| --- | --- | --- |
+| `Pretty` = false | `--plain` | PaddleOCR's plain variant: unstyled tables, captions as text |
+| `MergeTables` | `--merge-tables` | rejoin a table split by a page break (`MergeTablesAcrossPages`): the last table of a page and the first of the next, with only page furniture or footnotes between, widths within 10%, and the same columns; a repeated header is dropped |
+| `TitleLevels` | `--title-levels` | heading depth from the whole document (`AssignTitleLevels`): the numbering's depth, the numbering style's first appearance and the text size ranked among all headings, two of three deciding; section names (Abstract, References, …) are level one |
+| `DocTitle` = false | `--no-doc-title` | never write the opening heading as the title |
+
+With `MergeTables` or `TitleLevels`, `NanoOCR.Predict` returns a file's pages once its last page is
+done. A caller driving `NanoOcrEngine` or `DocumentConverter` directly calls
+`MarkdownDocument.Finish(pages, options)` on a document's pages for the same result.
 
 ## Validation
 
@@ -116,7 +152,7 @@ produced on demand rather than committed, and the tests that need them skip when
 | --- | --- | --- |
 | `LayerParityTests` | every node output of all 10 models (1,857 tensors) vs ONNX Runtime | all within tolerance (worst at 7% of it); CTC ids and lengths exact |
 | `ImagingParityTests` | resize (linear, area, fast area), warpAffine 8-bit and float, connected components, PNG gray decode, TIFF in 7 compressions vs OpenCV | **byte-exact**, 54 cases |
-| `PipelineParityTests` | orientation, deskewed page, boxes, per-line text/confidence/tokens, final pages; PDF renders and text layers; auto and OCR modes; math | upright pages byte-identical, boxes within 1e-4 px, every line and token identical, **markdown identical** on every page |
+| `PipelineParityTests` | orientation, deskewed page, boxes, per-line text/confidence/tokens, final pages; PDF renders and text layers; auto and OCR modes; math | upright pages byte-identical, boxes within 1e-4 px, every line and token identical, **markdown identical** on every page (in the reference style) |
 | `UnitTests` | the Python package's own unit tests, ported | pass |
 
 ```shell

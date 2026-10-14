@@ -90,7 +90,10 @@ public sealed class Page
     [JsonPropertyName("timings")]
     public Dictionary<string, double> Timings { get; set; } = [];
 
-    /// <summary>Markdown: headings, paragraphs, lists, and tables as HTML.</summary>
+    /// <summary>
+    /// Markdown: headings, paragraphs, lists, and tables as HTML, in the engine's
+    /// <see cref="EngineOptions.Markdown"/> style.
+    /// </summary>
     [JsonPropertyName("markdown")]
     public string? Markdown { get; set; }
 
@@ -105,6 +108,14 @@ public sealed class Page
     /// <summary>Layout blocks in reading order.</summary>
     [JsonPropertyName("blocks")]
     public List<Block> Blocks { get; set; } = [];
+
+    /// <summary>
+    /// The layout blocks as the markdown writers see them (<see cref="Layout.PageElements"/>);
+    /// <see langword="null"/> when the page had no layout. <see cref="MarkdownDocument.Finish"/>
+    /// re-renders <see cref="Markdown"/> from them.
+    /// </summary>
+    [JsonIgnore]
+    public List<PageElement>? Elements { get; set; }
 
     /// <summary>Degrees counter-clockwise the input was turned; boxes are in the upright page.</summary>
     [JsonPropertyName("rotation")]

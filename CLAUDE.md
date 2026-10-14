@@ -21,7 +21,8 @@ images; PDFium (native, via P/Invoke — the engine pypdfium2 wraps) renders PDF
 | `src/NanoOcr/Pipeline/LineCrops.cs` | `rec_preproc.py`, `line_mask.crop_lines` |
 | `src/NanoOcr/Pipeline/Vocab.cs` | `vocab.py` (the inference parts) |
 | `src/NanoOcr/Pipeline/ReadingOrder.cs` | `order_post.py` |
-| `src/NanoOcr/Pipeline/Layout.cs` | `layout_post.py` |
+| `src/NanoOcr/Pipeline/Layout.cs` | `layout_post.py` (blocks → `PageElement`s; `PageMarkdown` is `page_markdown`) |
+| `src/NanoOcr/Pipeline/MarkdownWriter.cs`, `MarkdownDocument.cs`, `TitleLevels.cs`, `TableMerger.cs` | not Indra: PaddleOCR's markdown (PaddleX `MarkdownConverter`, `assign_levels_to_parsing_res`, `merge_tables_across_pages`, as the sibling port PaddleOcrSharp has them) on NanoOCR's blocks |
 | `src/NanoOcr/Pipeline/MathReader.cs` | `math.py` |
 | `src/NanoOcr/Pipeline/TextLayer.cs` | `textlayer.py` |
 | `src/NanoOcr/Pipeline/DocumentConverter.cs` | `document.py` |
@@ -70,12 +71,20 @@ helpers (`encode_targets`, vocabulary builders, label canonicalization).
   INTER_AREA row sum and the summed-area table's first row are the examples in the code).
 - Read the Python for a stage before writing the C#, and name the Python function in the doc
   comment.
+- **The markdown is PaddleOCR's, on purpose.** The default `MarkdownStyle.PaddleOcr` writes what
+  PaddleOCR's document parser writes (the sibling port `curiosity-ai/PaddleOCR`, `dotnet/`, is the
+  reference for that format), so the two engines' output is interchangeable; it is byte-identical
+  to PaddleOCR-VL 1.6's on the corpus pages where both read the same text. `MarkdownStyle.Reference`
+  is `page_markdown` byte for byte, and it is what `PipelineParityTests` pins — both styles render
+  the same `PageElement`s, so a change to how blocks are built shows in the parity tests, and a
+  change to the PaddleOCR style shows in `MarkdownTests`. The document-level passes (title, title
+  levels, table merging) run in `MarkdownDocument.Finish`, which `NanoOCR` applies per file.
 
 ## Validation
 
 See the README's *Validation* section and [`tools/reference/README.md`](tools/reference/README.md).
 Any change to a kernel, an image operation or a pipeline stage must keep all of
-`LayerParityTests`, `ImagingParityTests`, `PipelineParityTests` and `UnitTests` green with the
+`LayerParityTests`, `ImagingParityTests`, `PipelineParityTests`, `MarkdownTests` and `UnitTests` green with the
 fixtures generated; a change that moves an output must say why.
 
 ## Building and testing
@@ -135,6 +144,21 @@ outputs within the ONNX Runtime tolerance (margins unchanged), every image opera
 against OpenCV, every line, token and markdown identical. The CLI's markdown for all 24 files of
 `tests/data/documents` (images, PDFs, TIFFs, with and without `--math`) is byte-identical between
 the build before this work and now.
+
+Against Python + ORT once more after the multi-threaded work (2026-10-14, same VM, best of 7 warm,
+two interleaved rounds, total page time):
+
+| page | Python 1 thread | C# 1 thread | Python 4 threads | C# 4 threads |
+| --- | --- | --- | --- | --- |
+| two-column 1700×2200 | 267-269 ms | 205-210 ms | 290-372 ms | 118 ms |
+| skewed | 241-272 ms | 220 ms | 265-293 ms | 117-131 ms |
+| Chinese | 85-87 ms | 81 ms | 176-189 ms | 46-48 ms |
+| math (`--math` off) | 72-74 ms | 73 ms | 145-148 ms | 42-49 ms |
+
+On one thread the small pages (a few lines) are at parity — their time is the orientation and
+detection models, where ORT's MLAS and this GEMM are about even — and the full pages 1.2-1.3×
+faster. At four threads Python's `OrtOCR(threads=4)` is slower than its own single thread on this
+VM, so the gap there is 2.5-4×.
 
 ### Multi-threaded
 

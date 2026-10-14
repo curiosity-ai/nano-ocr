@@ -30,6 +30,13 @@ public sealed class EngineOptions
     /// results, slower; there for A/B comparisons.
     /// </summary>
     public bool Fusion { get; set; } = true;
+
+    /// <summary>
+    /// How <see cref="Page.Markdown"/> is written: PaddleOCR-style by default,
+    /// <see cref="MarkdownOptions.Reference"/> for the Python original's. The document-level
+    /// passes in it are applied by <see cref="MarkdownDocument.Finish"/>, not per page.
+    /// </summary>
+    public MarkdownOptions Markdown { get; set; } = MarkdownOptions.Default;
 }
 
 /// <summary>
@@ -859,6 +866,7 @@ public sealed class NanoOcrEngine
             Py.Round(rec[i].Conf, 4))).ToList();
         string? md = null;
         var blocks = new List<Block>();
+        List<PageElement>? elements = null;
         if (layout is not null)
         {
             blocks = Layout.PageBlocks(boxes, texts, order, layout.Cls, layout.Same)
@@ -869,13 +877,14 @@ public sealed class NanoOcrEngine
                 cells[i] = SplitLine(boxes[i], rec[i].Tokens, CellGap).Select(p => (p.Box, p.Text)).ToList();
             }
 
-            md = Layout.PageMarkdown(boxes, texts, order, layout.Cls, layout.Same, Options.Furniture, cells, layout.Tab);
+            elements = Layout.PageElements(boxes, texts, order, layout.Cls, layout.Same, cells, layout.Tab);
+            md = MarkdownWriter.Write(elements, Options.Markdown, Options.Furniture);
         }
         else if (boxes.Count < 2)
         {
             md = string.Join("\n", texts);
         }
 
-        return new Page { Lines = lines, Timings = t, Markdown = md, Note = note, Blocks = blocks };
+        return new Page { Lines = lines, Timings = t, Markdown = md, Note = note, Blocks = blocks, Elements = elements };
     }
 }

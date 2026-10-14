@@ -49,6 +49,14 @@ public sealed class NanoOcrOptions
     /// runs each graph as written — same results, slower; there for comparisons.
     /// </summary>
     public bool Fusion { get; set; } = true;
+
+    /// <summary>
+    /// How the markdown is written: PaddleOCR-style by default (see <see cref="MarkdownWriter"/>),
+    /// <see cref="MarkdownOptions.Reference"/> for the Python original's. With
+    /// <see cref="MarkdownOptions.MergeTables"/> or <see cref="MarkdownOptions.TitleLevels"/> a
+    /// file's pages are returned together, once its last page is done.
+    /// </summary>
+    public MarkdownOptions Markdown { get; set; } = MarkdownOptions.Default;
 }
 
 /// <summary>
@@ -83,6 +91,7 @@ public sealed class NanoOCR : IDisposable
             Math = Options.Math,
             TableHeads = Options.TableHeads,
             Fusion = Options.Fusion,
+            Markdown = Options.Markdown,
         });
         _converter = new DocumentConverter(Engine, Options.Dpi, Options.Mode, Options.PdfOrder, Options.ImageOcr);
     }
@@ -109,10 +118,36 @@ public sealed class NanoOCR : IDisposable
             : [input];
         foreach (string file in files)
         {
-            foreach (OcrResult r in PredictFile(file, maxPages, password))
+            foreach (OcrResult r in Finished(PredictFile(file, maxPages, password)))
             {
                 yield return r;
             }
+        }
+    }
+
+    /// <summary>
+    /// A document's pages with the document-level markdown passes applied
+    /// (<see cref="MarkdownDocument.Finish"/>): page by page when they need only the page itself
+    /// (and the first page, for the title), held until the last page when they need them all.
+    /// </summary>
+    private IEnumerable<OcrResult> Finished(IEnumerable<OcrResult> results)
+    {
+        if (Options.Markdown.NeedsDocument)
+        {
+            List<OcrResult> all = results.ToList();
+            MarkdownDocument.Finish(all.Select(r => r.Page).ToList(), Options.Markdown, Options.Furniture);
+            foreach (OcrResult r in all)
+            {
+                yield return r;
+            }
+
+            yield break;
+        }
+
+        foreach (OcrResult r in results)
+        {
+            MarkdownDocument.Finish([r.Page], Options.Markdown, Options.Furniture, first: r.PageIndex == 0);
+            yield return r;
         }
     }
 
@@ -180,13 +215,15 @@ public sealed class NanoOCR : IDisposable
     }
 
     /// <summary>OCR of an in-memory grayscale page.</summary>
-    public OcrResult Predict(GrayImage image) => PredictImage(image, "", 0);
+    public OcrResult Predict(GrayImage image) => Finished([PredictImage(image, "", 0)]).Single();
 
     /// <summary>OCR of a SkiaSharp bitmap.</summary>
-    public OcrResult Predict(SKBitmap bitmap) => PredictImage(ImageIO.FromBitmap(bitmap), "", 0);
+    public OcrResult Predict(SKBitmap bitmap) => Predict(ImageIO.FromBitmap(bitmap));
 
     /// <summary>OCR of encoded image bytes (PNG, JPEG, …) or a PDF.</summary>
-    public IEnumerable<OcrResult> Predict(byte[] encoded, string? password = null)
+    public IEnumerable<OcrResult> Predict(byte[] encoded, string? password = null) => Finished(PredictBytes(encoded, password));
+
+    private IEnumerable<OcrResult> PredictBytes(byte[] encoded, string? password)
     {
         if (PdfDocument.IsPdf(encoded))
         {
@@ -347,7 +384,7 @@ public sealed class NanoOCR : IDisposable
                 }
             }
 
-            yield return (p.Path, error is null ? pages : null, error);
+            yield return (p.Path, error is null ? Finished(pages).ToList() : null, error);
         }
     }
 
