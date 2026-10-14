@@ -134,20 +134,32 @@ public sealed class NanoOcrEngine
         int h = gray.Height, w = gray.Width;
         double s = (double)side / Math.Max(h, w);
         int sw = (int)Math.Max(1, Py.Round(w * s)), sh = (int)Math.Max(1, Py.Round(h * s));
-        GrayImage small = CvResize.Resize(gray, sw, sh, Interpolation.Area);
-        var ink = new float[sw * sh];
-        for (int i = 0; i < ink.Length; i++)
+        GrayImage small = GrayImage.Rent(sw, sh);
+        CvResize.ResizeInto(gray, small, Interpolation.Area);
+        float[] ink = System.Buffers.ArrayPool<float>.Shared.Rent(sw * sh);
+        for (int i = 0; i < sw * sh; i++)
         {
             ink[i] = (255f - small.Pixels[i]) / 255f;
         }
 
-        if (Py.Mean(ink) < 0.003)
+        small.Return();
+        int[] nonzero = System.Buffers.ArrayPool<int>.Shared.Rent((sw + 1) * (sh + 1));
+        try
         {
-            return 0.0;
+            return Py.Mean(ink.AsSpan(0, sw * sh)) < 0.003 ? 0.0 : SkewSearch(ink, nonzero, sw, sh);
         }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(ink);
+            System.Buffers.ArrayPool<int>.Shared.Return(nonzero);
+        }
+    }
 
+    /// <summary>The coarse-then-fine angle search of <see cref="EstimateSkew"/> over a thumbnail's ink map.</summary>
+    private static double SkewSearch(float[] ink, int[] nonzero, int sw, int sh)
+    {
         double cx = sw / 2.0, cy = sh / 2.0;
-        int[] nonzero = CvWarp.NonzeroTable(ink, sw, sh);
+        CvWarp.NonzeroTable(ink, sw, sh, nonzero);
 
         // sharpness(a): the warped page's row sums (numpy's pairwise float32 sums), then the
         // pairwise sum of their squared differences. Each row is reduced as soon as it is warped,
@@ -155,22 +167,23 @@ public sealed class NanoOcrEngine
         double Sharpness(double a)
         {
             float[] m = CvWarp.InverseFloat(CvWarp.RotationMatrix(cx, cy, a));
-            var row = new float[sw];
-            var rows = new float[sh];
+            float[] buffer = System.Buffers.ArrayPool<float>.Shared.Rent(sw + (2 * sh));
+            Span<float> row = buffer.AsSpan(0, sw), rows = buffer.AsSpan(sw, sh), diffs = buffer.AsSpan(sw + sh, Math.Max(0, sh - 1));
             for (int y = 0; y < sh; y++)
             {
                 // A row whose every chunk was skipped is all +0, whose pairwise sum is +0.
                 rows[y] = CvWarp.WarpConstantZeroRowSparse(ink, sw, sh, m, y, row, nonzero) ? Py.PairwiseSum(row) : 0f;
             }
 
-            var diffs = new float[Math.Max(0, sh - 1)];
             for (int y = 0; y + 1 < sh; y++)
             {
                 float d = rows[y + 1] - rows[y];
                 diffs[y] = d * d;
             }
 
-            return Py.PairwiseSum(diffs);
+            float sharp = Py.PairwiseSum(diffs);
+            System.Buffers.ArrayPool<float>.Shared.Return(buffer);
+            return sharp;
         }
 
         double Search(IEnumerable<double> angles)
@@ -240,11 +253,20 @@ public sealed class NanoOcrEngine
     /// <summary><c>orient_input</c>: a <c>[side, side]</c> ink map, long side scaled to <paramref name="side"/>, padded.</summary>
     public static float[] OrientInput(GrayImage gray, int side = OrientSide)
     {
+        var result = new float[side * side];
+        OrientInput(gray, side, result);
+        return result;
+    }
+
+    /// <summary><see cref="OrientInput(GrayImage, int)"/> into <paramref name="result"/> (at least <c>side²</c> long).</summary>
+    private static void OrientInput(GrayImage gray, int side, float[] result)
+    {
         int h = gray.Height, w = gray.Width;
         double s = (double)side / Math.Max(h, w);
         int sw = (int)Math.Max(1, Py.Round(w * s)), sh = (int)Math.Max(1, Py.Round(h * s));
-        GrayImage small = CvResize.Resize(gray, sw, sh, Interpolation.Area);
-        var result = new float[side * side];
+        GrayImage small = GrayImage.Rent(sw, sh);
+        CvResize.ResizeInto(gray, small, Interpolation.Area);
+        Array.Clear(result, 0, side * side);
         for (int y = 0; y < Math.Min(sh, side); y++)
         {
             for (int x = 0; x < Math.Min(sw, side); x++)
@@ -253,7 +275,7 @@ public sealed class NanoOcrEngine
             }
         }
 
-        return result;
+        small.Return();
     }
 
     /// <summary>
@@ -267,8 +289,11 @@ public sealed class NanoOcrEngine
             return 0;
         }
 
-        Tensor x = Tensor.FromFloats(OrientInput(gray), 1, 1, OrientSide, OrientSide);
+        float[] input = System.Buffers.ArrayPool<float>.Shared.Rent(OrientSide * OrientSide);
+        OrientInput(gray, OrientSide, input);
+        Tensor x = Tensor.FromFloats(input, 1, 1, OrientSide, OrientSide);
         Tensor[] outs = _orient.Run(new Dictionary<string, Tensor> { ["x"] = x });
+        System.Buffers.ArrayPool<float>.Shared.Return(input);
         float[] p = outs[0].ToFloatArray();
         outs[0].Release();
         int k = Py.ArgMax(p);
@@ -301,10 +326,11 @@ public sealed class NanoOcrEngine
 
     private List<LineBox> DetectAt(GrayImage gray, int longSide, out double scale)
     {
-        (float[] ink, int h, int w, double s) = Detection.PageToInput(gray, longSide);
+        (float[] ink, int h, int w, double s) = Detection.PageToInput(gray, longSide, pooled: true);
         scale = s;
         Tensor x = Tensor.FromFloats(ink, 1, 1, h, w);
         Tensor[] outs = _det.Run(new Dictionary<string, Tensor> { ["x"] = x });
+        System.Buffers.ArrayPool<float>.Shared.Return(ink);
         Tensor o = outs[0];
         List<LineBox> boxes = Detection.Decode(o.Floats, o.Shape[2], o.Shape[3]);
         o.Release();

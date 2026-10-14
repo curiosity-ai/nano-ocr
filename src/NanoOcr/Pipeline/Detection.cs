@@ -59,7 +59,13 @@ public static class Detection
     /// (area when shrinking, linear when enlarging), as an ink map (1 = ink) padded with paper to
     /// multiples of 32.
     /// </summary>
-    public static (float[] Ink, int Height, int Width, double Scale) PageToInput(GrayImage gray, int longSide)
+    public static (float[] Ink, int Height, int Width, double Scale) PageToInput(GrayImage gray, int longSide) => PageToInput(gray, longSide, pooled: false);
+
+    /// <summary>
+    /// <see cref="PageToInput(GrayImage, int)"/>; with <paramref name="pooled"/> the ink buffer is
+    /// rented from <see cref="System.Buffers.ArrayPool{T}.Shared"/> (and may be longer than <c>Height·Width</c>).
+    /// </summary>
+    internal static (float[] Ink, int Height, int Width, double Scale) PageToInput(GrayImage gray, int longSide, bool pooled)
     {
         int h = gray.Height, w = gray.Width;
         double scale = (double)longSide / Math.Max(h, w);
@@ -67,13 +73,24 @@ public static class Detection
         GrayImage img = gray;
         if (nh != h || nw != w)
         {
-            img = CvResize.Resize(gray, nw, nh, scale < 1 ? Interpolation.Area : Interpolation.Linear);
+            img = GrayImage.Rent(nw, nh);
+            CvResize.ResizeInto(gray, img, scale < 1 ? Interpolation.Area : Interpolation.Linear);
         }
 
         int ph = (nh + InputMultiple - 1) / InputMultiple * InputMultiple;
         int pw = (nw + InputMultiple - 1) / InputMultiple * InputMultiple;
-        var ink = new float[ph * pw];
+        float[] ink = pooled ? System.Buffers.ArrayPool<float>.Shared.Rent(ph * pw) : new float[ph * pw];
+        if (pooled)
+        {
+            Array.Clear(ink, 0, ph * pw);
+        }
+
         InkMap(img, ink, pw);
+        if (!ReferenceEquals(img, gray))
+        {
+            img.Return();
+        }
+
         return (ink, ph, pw, scale);
     }
 

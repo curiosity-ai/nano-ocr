@@ -207,12 +207,13 @@ public static class CvWarp
         return any;
     }
 
-    /// <summary>Summed-area table of <c>src != 0</c>, <c>(w + 1)·(h + 1)</c> entries.</summary>
-    internal static int[] NonzeroTable(ReadOnlySpan<float> src, int w, int h)
+    /// <summary>Summed-area table of <c>src != 0</c>, <c>(w + 1)·(h + 1)</c> entries, into <paramref name="t"/>.</summary>
+    internal static void NonzeroTable(ReadOnlySpan<float> src, int w, int h, int[] t)
     {
-        var t = new int[(w + 1) * (h + 1)];
+        Array.Clear(t, 0, w + 1);
         for (int y = 0; y < h; y++)
         {
+            t[(y + 1) * (w + 1)] = 0;
             int run = 0;
             ReadOnlySpan<float> r = src.Slice(y * w, w);
             int o = (y + 1) * (w + 1), up = y * (w + 1);
@@ -222,8 +223,6 @@ public static class CvWarp
                 t[o + x + 1] = t[up + x + 1] + run;
             }
         }
-
-        return t;
     }
 
     private static int CountNonzero(int[] t, int w, int x0, int y0, int x1, int y1)

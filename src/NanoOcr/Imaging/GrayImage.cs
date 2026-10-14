@@ -43,6 +43,13 @@ public sealed class GrayImage
         set => Pixels[(y * Width) + x] = value;
     }
 
+    /// <summary>An image over a buffer rented from <see cref="System.Buffers.ArrayPool{T}.Shared"/>; contents undefined.</summary>
+    internal static GrayImage Rent(int width, int height) =>
+        new(width, height, System.Buffers.ArrayPool<byte>.Shared.Rent(Math.Max(1, checked(width * height))));
+
+    /// <summary>Gives a <see cref="Rent"/>ed image's buffer back; the image must not be used afterwards.</summary>
+    internal void Return() => System.Buffers.ArrayPool<byte>.Shared.Return(Pixels);
+
     /// <summary>A deep copy.</summary>
     public GrayImage Clone() => new(Width, Height, (byte[])Pixels.Clone());
 

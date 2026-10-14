@@ -48,6 +48,24 @@ public static class CvResize
             return src.Clone();
         }
 
+        var dst = new GrayImage(width, height);
+        ResizeInto(src, dst, interpolation);
+        return dst;
+    }
+
+    /// <summary>
+    /// <see cref="Resize"/> into an existing image of the target size (a pooled one, say); every
+    /// pixel of <paramref name="dst"/> is written.
+    /// </summary>
+    internal static void ResizeInto(GrayImage src, GrayImage dst, Interpolation interpolation)
+    {
+        int width = dst.Width, height = dst.Height;
+        if (width == src.Width && height == src.Height)
+        {
+            src.Pixels.AsSpan(0, width * height).CopyTo(dst.Pixels);
+            return;
+        }
+
         double invScaleX = (double)width / src.Width;
         double invScaleY = (double)height / src.Height;
         double scaleX = 1.0 / invScaleX, scaleY = 1.0 / invScaleY;
@@ -59,7 +77,6 @@ public static class CvResize
             interpolation = Interpolation.Area;
         }
 
-        var dst = new GrayImage(width, height);
         if (interpolation == Interpolation.Area && scaleX >= 1 && scaleY >= 1)
         {
             if (areaFast)
@@ -71,11 +88,10 @@ public static class CvResize
                 Area(src, dst, scaleX, scaleY);
             }
 
-            return dst;
+            return;
         }
 
         Linear(src, dst, scaleX, scaleY, invScaleX, invScaleY, interpolation == Interpolation.Area);
-        return dst;
     }
 
     /// <summary>OpenCV's <c>saturate_cast&lt;int&gt;(double)</c>: round half to even.</summary>

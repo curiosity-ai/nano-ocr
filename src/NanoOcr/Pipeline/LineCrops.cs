@@ -45,8 +45,8 @@ public static class LineCrops
         int ix0 = (int)Math.Floor(bx0), iy0 = (int)Math.Floor(by0);
         int ix1 = (int)Math.Ceiling(bx1), iy1 = (int)Math.Ceiling(by1);
         int cw = Math.Max(1, ix1 - ix0), ch = Math.Max(1, iy1 - iy0);
-        var crop = new GrayImage(cw, ch);
-        Array.Fill(crop.Pixels, (byte)255);
+        GrayImage crop = GrayImage.Rent(cw, ch);
+        crop.Pixels.AsSpan(0, cw * ch).Fill(255);
         int sx0 = Math.Max(0, ix0), sy0 = Math.Max(0, iy0), sx1 = Math.Min(gray.Width, ix1), sy1 = Math.Min(gray.Height, iy1);
         if (sx1 > sx0 && sy1 > sy0)
         {
@@ -57,9 +57,12 @@ public static class LineCrops
         }
 
         int outW = (int)Math.Max(WidthMultiple, Math.Min(maxWidth, Py.Round(cw * (double)height / ch)));
-        GrayImage resized = CvResize.Resize(crop, outW, height, ch > height ? Interpolation.Area : Interpolation.Linear);
+        GrayImage resized = GrayImage.Rent(outW, height);
+        CvResize.ResizeInto(crop, resized, ch > height ? Interpolation.Area : Interpolation.Linear);
+        crop.Return();
         var ink = new float[height * outW];
         Detection.InkMap(resized, ink, outW);
+        resized.Return();
         return new LineCrop(ink, height, outW);
     }
 
