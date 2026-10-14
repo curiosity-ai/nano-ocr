@@ -325,28 +325,38 @@ internal static partial class Operators
         int t = p.H * p.W, c = p.C, m = p.M, cols = n * t;
         if (Gemm.Wide)
         {
-            // The product reads the items in place and writes them in place; then bias and
-            // epilogue per output row, the same Σ + bias as the packed path below.
-            Gemm.MultiplyBatched(m, t, n, c, weight, c, input, (long)c * t, output, (long)m * t, rowScale: gate is null ? default : gate.AsSpan(0, n * c));
-            Parallelism.For(n, (long)m * cols, (b0, b1) =>
+            // The product reads the items in place and writes them in place. Bias, residual,
+            // HardSwish and mask are applied to each finished strip inside the product; a ReLU or
+            // sigmoid epilogue (the small squeeze-excite convolutions) runs as a pass afterwards.
+            // Either way: Σ, + bias, + residual, activation, × mask, each rounded once.
+            bool inStrip = epilogue.Act is Activation.None or Activation.HardSwish;
+            unsafe
             {
-                for (int b = b0; b < b1; b++)
+                fixed (float* pb = bias)
+                fixed (float* pr = epilogue.Residual)
+                fixed (float* pm = epilogue.Mask)
                 {
-                    for (int r = 0; r < m; r++)
-                    {
-                        Span<float> dst = output.AsSpan(((b * m) + r) * t, t);
-                        if (bias is not null)
-                        {
-                            TensorPrimitives.Add(dst, bias[r], dst);
-                        }
+                    var strip = inStrip
+                        ? new Gemm.StripEpilogue((nint)pb, (nint)pr, epilogue.Act == Activation.HardSwish, (nint)pm)
+                        : new Gemm.StripEpilogue((nint)pb, 0, false, 0);
+                    Gemm.MultiplyBatched(m, t, n, c, weight, c, input, (long)c * t, output, (long)m * t, rowScale: gate is null ? default : gate.AsSpan(0, n * c), epilogue: strip);
+                }
+            }
 
-                        if (!epilogue.IsEmpty)
+            if (!inStrip && !epilogue.IsEmpty)
+            {
+                Parallelism.For(n, (long)m * cols, (b0, b1) =>
+                {
+                    for (int b = b0; b < b1; b++)
+                    {
+                        for (int r = 0; r < m; r++)
                         {
-                            epilogue.Apply(dst, ((b * m) + r) * t);
+                            epilogue.Apply(output.AsSpan(((b * m) + r) * t, t), ((b * m) + r) * t);
                         }
                     }
-                }
-            });
+                });
+            }
+
             return;
         }
 

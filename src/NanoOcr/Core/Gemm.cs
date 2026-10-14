@@ -83,7 +83,8 @@ public static unsafe class Gemm
     /// (one rounded multiply per element, applied while packing) — a per-item, per-channel gate on
     /// the convolution's input, such as a squeeze-excite output, without a pass over the input.
     /// </param>
-    public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride, bool accumulate = false, ReadOnlySpan<float> rowScale = default)
+    /// <param name="epilogue">Applied to each finished 32-column strip while it is in L1 (see <see cref="StripEpilogue"/>).</param>
+    public static void MultiplyBatched(int m, int t, int batch, int k, ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, long bStride, Span<float> c, long cStride, bool accumulate = false, ReadOnlySpan<float> rowScale = default, StripEpilogue epilogue = default)
     {
         if (!Wide)
         {
@@ -100,12 +101,32 @@ public static unsafe class Gemm
         fixed (float* pc = c)
         fixed (float* ps = rowScale)
         {
-            Run(pa, lda, pb, t, pc, t, m, t * batch, k, accumulate, new Segments(t, bStride, cStride, rowScale.IsEmpty ? 0 : (nint)ps, k));
+            Run(pa, lda, pb, t, pc, t, m, t * batch, k, accumulate, new Segments(t, bStride, cStride, rowScale.IsEmpty ? 0 : (nint)ps, k, epilogue));
         }
     }
 
     /// <summary>How logical columns map to memory: <see cref="Len"/> columns per item, items <see cref="BStride"/> / <see cref="CStride"/> apart.</summary>
-    private readonly struct Segments(int len, long bStride, long cStride, nint scale = 0, int scaleStride = 0)
+    /// <summary>
+    /// What <see cref="MultiplyBatched"/> does to each output element once its sum is complete,
+    /// in this order: add <c>Bias[row]</c>, add the residual at the same offset as the output,
+    /// apply the activation, multiply by <c>Mask[column]</c> (the mask is <c>[batch, t]</c>, so its
+    /// index is the logical column). Each step is one rounded operation, as the element-wise
+    /// nodes it replaces compute it. Pointers are <c>float*</c>; zero means absent.
+    /// </summary>
+    public readonly struct StripEpilogue(nint bias, nint residual, bool hardSwish, nint mask)
+    {
+        public nint Bias { get; } = bias;
+
+        public nint Residual { get; } = residual;
+
+        public bool HardSwish { get; } = hardSwish;
+
+        public nint Mask { get; } = mask;
+
+        public bool IsEmpty => Bias == 0 && Residual == 0 && !HardSwish && Mask == 0;
+    }
+
+    private readonly struct Segments(int len, long bStride, long cStride, nint scale = 0, int scaleStride = 0, StripEpilogue epilogue = default)
     {
         public static readonly Segments None = new(int.MaxValue, 0, 0);
 
@@ -119,6 +140,8 @@ public static unsafe class Gemm
         public nint Scale { get; } = scale;
 
         public int ScaleStride { get; } = scaleStride;
+
+        public StripEpilogue Epilogue { get; } = epilogue;
 
         public bool IsNone => Len == int.MaxValue;
 
@@ -464,6 +487,11 @@ public static unsafe class Gemm
                             {
                                 Edge512(a + (i * (long)lda) + kb, lda, strip, kc, c + (i * (long)ldc), ldc, i1 - i, js, width, add, seg);
                             }
+
+                            if (kb + kc >= k && !seg.Epilogue.IsEmpty)
+                            {
+                                FinishStrip(c, ldc, i0, i1, js, width, seg);
+                            }
                         }
                     }
                 }
@@ -472,6 +500,86 @@ public static unsafe class Gemm
         finally
         {
             System.Buffers.ArrayPool<float>.Shared.Return(buffer);
+        }
+    }
+
+    /// <summary>Applies <see cref="Segments.Epilogue"/> to rows <c>[i0, i1)</c> of a finished strip, one item's run of columns at a time.</summary>
+    private static void FinishStrip(float* c, int ldc, int i0, int i1, int js, int width, Segments seg)
+    {
+        StripEpilogue e = seg.Epilogue;
+        for (int q0 = 0; q0 < width;)
+        {
+            int j = js + q0;
+            int run = seg.IsNone ? width - q0 : Math.Min(width - q0, seg.Len - (j % seg.Len));
+            long col = seg.IsNone ? j : seg.C(j);
+            float* mask = e.Mask == 0 ? null : (float*)e.Mask + j;
+            for (int r = i0; r < i1; r++)
+            {
+                long off = (r * (long)ldc) + col;
+                FinishRun(c + off, run, e.Bias == 0 ? 0f : ((float*)e.Bias)[r], e.Bias != 0, e.Residual == 0 ? null : (float*)e.Residual + off, e.HardSwish, mask);
+            }
+
+            q0 += run;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FinishRun(float* p, int n, float bias, bool hasBias, float* residual, bool hardSwish, float* mask)
+    {
+        int x = 0;
+        var vb = Vector512.Create(bias);
+        var sixth = Vector512.Create(1f / 6f);
+        var half = Vector512.Create(0.5f);
+        for (; x + 16 <= n; x += 16)
+        {
+            Vector512<float> v = Vector512.Load(p + x);
+            if (hasBias)
+            {
+                v += vb;
+            }
+
+            if (residual != null)
+            {
+                v += Vector512.Load(residual + x);
+            }
+
+            if (hardSwish)
+            {
+                v *= Vector512.Min(Vector512<float>.One, Vector512.Max(Vector512<float>.Zero, (v * sixth) + half));
+            }
+
+            if (mask != null)
+            {
+                v *= Vector512.Load(mask + x);
+            }
+
+            v.Store(p + x);
+        }
+
+        for (; x < n; x++)
+        {
+            float v = p[x];
+            if (hasBias)
+            {
+                v += bias;
+            }
+
+            if (residual != null)
+            {
+                v += residual[x];
+            }
+
+            if (hardSwish)
+            {
+                v *= MathF.Min(1f, MathF.Max(0f, (v * (1f / 6f)) + 0.5f));
+            }
+
+            if (mask != null)
+            {
+                v *= mask[x];
+            }
+
+            p[x] = v;
         }
     }
 
