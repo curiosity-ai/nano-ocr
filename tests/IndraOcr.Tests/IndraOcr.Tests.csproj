@@ -14,7 +14,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\IndraOcr\IndraOcr.csproj" />
-    <ProjectReference Include="..\..\src\IndraOcr.Vlm\IndraOcr.Vlm.csproj" />
   </ItemGroup>
 
 </Project>

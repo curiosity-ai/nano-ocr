@@ -2,8 +2,6 @@
   <Folder Name="/src/">
     <Project Path="src/IndraOcr/IndraOcr.csproj" />
     <Project Path="src/IndraOcr.Cli/IndraOcr.Cli.csproj" />
-    <Project Path="src/IndraOcr.Vlm/IndraOcr.Vlm.csproj" />
-    <Project Path="src/IndraOcr.Vlm.Cli/IndraOcr.Vlm.Cli.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/IndraOcr.Tests/IndraOcr.Tests.csproj" />

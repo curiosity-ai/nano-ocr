@@ -19,9 +19,6 @@ internal static partial class Pdfium
     public const int FPDF_ANNOT = 0x01;
     public const int FPDF_GRAYSCALE = 0x08;
     public const int FPDFBitmap_Gray = 1;
-    public const int FPDFBitmap_BGR = 2;
-    public const int FLATTEN_FAIL = 0;
-    public const int FLAT_NORMALDISPLAY = 0;
     public const int FPDF_PAGEOBJ_TEXT = 1;
     public const int FPDF_PAGEOBJ_FORM = 5;
     public const int FPDF_TEXTRENDERMODE_INVISIBLE = 3;
@@ -88,9 +85,6 @@ internal static partial class Pdfium
     [LibraryImport(Lib)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool FPDF_PageToDevice(IntPtr page, int startX, int startY, int sizeX, int sizeY, int rotate, double pageX, double pageY, out int deviceX, out int deviceY);
-
-    [LibraryImport(Lib)]
-    public static partial int FPDFPage_Flatten(IntPtr page, int flag);
 
     [LibraryImport(Lib)]
     public static partial IntPtr FPDFText_LoadPage(IntPtr page);
