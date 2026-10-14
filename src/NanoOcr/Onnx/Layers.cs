@@ -826,6 +826,21 @@ internal static partial class Operators
         int ow = ceil ? (int)Math.Ceiling((w + pl + pr - kw) / (double)sw) + 1 : ((w + pl + pr - kw) / sw) + 1;
         Tensor result = Tensor.Float([n, c, oh, ow]);
         float[] src = input.FloatArray, dst = result.FloatArray;
+        if (kh == 2 && kw == 2 && sh == 2 && sw == 2 && pt == 0 && pl == 0 && pb == 0 && pr == 0 && !ceil)
+        {
+            Parallelism.For(n * c, (long)n * c * oh * ow * 4, (s, e) =>
+            {
+                for (int plane = s; plane < e; plane++)
+                {
+                    for (int oy = 0; oy < oh; oy++)
+                    {
+                        Pool2x2Row(src.AsSpan((plane * h * w) + (2 * oy * w), w), src.AsSpan((plane * h * w) + (((2 * oy) + 1) * w), w), dst.AsSpan((plane * oh * ow) + (oy * ow), ow), max);
+                    }
+                }
+            });
+            return result;
+        }
+
         Parallelism.For(n * c, (long)n * c * oh * ow * kh * kw, (s, e) =>
         {
             for (int plane = s; plane < e; plane++)
@@ -874,6 +889,41 @@ internal static partial class Operators
             }
         });
         return result;
+    }
+
+    /// <summary>
+    /// One output row of a 2×2, stride-2, unpadded pool: <c>max(a, b, c, d)</c>, or
+    /// <c>(((a + b) + c) + d) / 4</c> — the general loop's order — with the window's columns
+    /// split into even and odd lanes.
+    /// </summary>
+    private static void Pool2x2Row(ReadOnlySpan<float> r0, ReadOnlySpan<float> r1, Span<float> dst, bool max)
+    {
+        int x = 0;
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            for (; (2 * x) + 16 <= r0.Length && x + 8 <= dst.Length; x += 8)
+            {
+                Vector256<float> a0 = Vector256.Create(r0.Slice(2 * x, 8)), a1 = Vector256.Create(r0.Slice((2 * x) + 8, 8));
+                Vector256<float> b0 = Vector256.Create(r1.Slice(2 * x, 8)), b1 = Vector256.Create(r1.Slice((2 * x) + 8, 8));
+                Vector256<float> e0 = Even(a0, a1), o0 = Odd(a0, a1), e1 = Even(b0, b1), o1 = Odd(b0, b1);
+                Vector256<float> v = max
+                    ? Vector256.Max(Vector256.Max(Vector256.Max(e0, o0), e1), o1)
+                    : (((e0 + o0) + e1) + o1) / Vector256.Create(4f);
+                v.CopyTo(dst.Slice(x, 8));
+            }
+        }
+
+        for (; x < dst.Length; x++)
+        {
+            float a = r0[2 * x], b = r0[(2 * x) + 1], c = r1[2 * x], d = r1[(2 * x) + 1];
+            dst[x] = max ? MathF.Max(MathF.Max(MathF.Max(a, b), c), d) : (((a + b) + c) + d) / 4;
+        }
+
+        static Vector256<float> Even(Vector256<float> a, Vector256<float> b) =>
+            System.Runtime.Intrinsics.X86.Avx2.Permute4x64(System.Runtime.Intrinsics.X86.Avx.Shuffle(a, b, 0b10_00_10_00).AsDouble(), 0b11_01_10_00).AsSingle();
+
+        static Vector256<float> Odd(Vector256<float> a, Vector256<float> b) =>
+            System.Runtime.Intrinsics.X86.Avx2.Permute4x64(System.Runtime.Intrinsics.X86.Avx.Shuffle(a, b, 0b11_01_11_01).AsDouble(), 0b11_01_10_00).AsSingle();
     }
 
     internal static Tensor Resize(OnnxNode node, List<Tensor?> x)
