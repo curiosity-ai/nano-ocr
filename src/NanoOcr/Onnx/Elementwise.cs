@@ -25,26 +25,26 @@ internal static partial class Operators
         {
             Tensor result = Tensor.Float(shape);
             float[] x = a.FloatArray, y = b.FloatArray, z = result.FloatArray;
-            var runs = new List<(int O, int Ao, int As, int Bo, int Bs, int Len)>();
-            Broadcast.Runs(shape, Broadcast.Strides(a.Shape, shape), Broadcast.Strides(b.Shape, shape),
-                (o, ao, ast, bo, bst, len) => runs.Add((o, ao, ast, bo, bst, len)));
-            if (runs.Count == 1 && result.Length >= 1 << 16)
+            var plan = new Broadcast.RunPlan(shape, Broadcast.Strides(a.Shape, shape), Broadcast.Strides(b.Shape, shape));
+            if (plan.Count == 1 && result.Length >= 1 << 16)
             {
                 // One long run: split it so every core takes a share.
-                var r = runs[0];
-                Core.Parallelism.For(r.Len, r.Len, (s0, s1) =>
-                    FloatRun(op, x, r.Ao + (s0 * r.As), r.As, y, r.Bo + (s0 * r.Bs), r.Bs, z, r.O + s0, s1 - s0));
+                plan.Offsets(0, out int ao, out int bo);
+                int sa = plan.StepA, sb = plan.StepB;
+                Core.Parallelism.For(plan.Inner, plan.Inner, (s0, s1) =>
+                    FloatRun(op, x, ao + (s0 * sa), sa, y, bo + (s0 * sb), sb, z, s0, s1 - s0));
                 return result;
             }
 
-            Core.Parallelism.For(runs.Count, result.Length, (s0, s1) =>
+            if (Core.Parallelism.Workers <= 1 || plan.Count == 1)
             {
-                for (int i = s0; i < s1; i++)
-                {
-                    var r = runs[i];
-                    FloatRun(op, x, r.Ao, r.As, y, r.Bo, r.Bs, z, r.O, r.Len);
-                }
-            });
+                FloatRuns(op, plan, x, y, z, 0, plan.Count);
+            }
+            else
+            {
+                Core.Parallelism.For(plan.Count, result.Length, (s0, s1) => FloatRuns(op, plan, x, y, z, s0, s1));
+            }
+
             return result;
         }
 
@@ -72,6 +72,15 @@ internal static partial class Operators
         }
 
         throw new NotSupportedException($"{op} on {a.Type}.");
+    }
+
+    private static void FloatRuns(BinaryOp op, Broadcast.RunPlan plan, float[] x, float[] y, float[] z, int r0, int r1)
+    {
+        for (int r = r0; r < r1; r++)
+        {
+            plan.Offsets(r, out int ao, out int bo);
+            FloatRun(op, x, ao, plan.StepA, y, bo, plan.StepB, z, r * plan.Inner, plan.Inner);
+        }
     }
 
     private static void FloatRun(BinaryOp op, float[] x, int xo, int xs, float[] y, int yo, int ys, float[] z, int zo, int n)

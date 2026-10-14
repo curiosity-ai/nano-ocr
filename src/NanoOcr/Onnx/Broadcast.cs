@@ -181,6 +181,93 @@ internal static class Broadcast
         }
     }
 
+    /// <summary>
+    /// The coalesced runs of a two-input broadcast, addressable by index, so a caller can walk
+    /// any range of them (one per worker) without materializing a list: one per channel row of a
+    /// <c>[B, C, T] · [B, C, 1]</c> multiply is thousands of runs a call.
+    /// </summary>
+    public sealed class RunPlan
+    {
+        private readonly int[] _dims;
+        private readonly int[] _sa;
+        private readonly int[] _sb;
+
+        public RunPlan(int[] outShape, int[] stridesA, int[] stridesB)
+        {
+            var dims = new List<int>();
+            var sa = new List<int>();
+            var sb = new List<int>();
+            for (int d = outShape.Length - 1; d >= 0; d--)
+            {
+                if (outShape[d] == 1)
+                {
+                    continue;
+                }
+
+                if (dims.Count > 0)
+                {
+                    int last = dims.Count - 1;
+                    bool aOk = (stridesA[d] == 0 && sa[last] == 0) || (sa[last] != 0 && stridesA[d] == sa[last] * dims[last]);
+                    bool bOk = (stridesB[d] == 0 && sb[last] == 0) || (sb[last] != 0 && stridesB[d] == sb[last] * dims[last]);
+                    if (aOk && bOk)
+                    {
+                        dims[last] *= outShape[d];
+                        continue;
+                    }
+                }
+
+                dims.Add(outShape[d]);
+                sa.Add(stridesA[d]);
+                sb.Add(stridesB[d]);
+            }
+
+            if (dims.Count == 0)
+            {
+                dims.Add(Tensor.SizeOf(outShape) == 0 ? 0 : 1);
+                sa.Add(0);
+                sb.Add(0);
+            }
+
+            _dims = [.. dims];
+            _sa = [.. sa];
+            _sb = [.. sb];
+            Inner = _dims[0];
+            StepA = _sa[0] == 0 ? 0 : 1;
+            StepB = _sb[0] == 0 ? 0 : 1;
+            Count = 1;
+            for (int i = 1; i < _dims.Length; i++)
+            {
+                Count *= _dims[i];
+            }
+        }
+
+        /// <summary>Number of runs.</summary>
+        public int Count { get; }
+
+        /// <summary>Length of every run.</summary>
+        public int Inner { get; }
+
+        /// <summary>Step of input A within a run (0 or 1).</summary>
+        public int StepA { get; }
+
+        /// <summary>Step of input B within a run (0 or 1).</summary>
+        public int StepB { get; }
+
+        /// <summary>The input offsets of run <paramref name="run"/> (its output offset is <c>run · Inner</c>).</summary>
+        public void Offsets(int run, out int offA, out int offB)
+        {
+            offA = 0;
+            offB = 0;
+            for (int i = 1; i < _dims.Length && run > 0; i++)
+            {
+                int c = run % _dims[i];
+                run /= _dims[i];
+                offA += c * _sa[i];
+                offB += c * _sb[i];
+            }
+        }
+    }
+
     /// <summary>One coalesced run of a two-input broadcast.</summary>
     public delegate void RunAction(int outOffset, int aOffset, int aStep, int bOffset, int bStep, int length);
 }

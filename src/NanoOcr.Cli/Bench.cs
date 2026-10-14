@@ -68,41 +68,35 @@ internal static class Bench
             Console.WriteLine($"  {k,-10} best {v.Min(),8:0.0} ms   median {Median(v),8:0.0}   spread {(v.Max() - v.Min()) / v.Min():P0}");
         }
 
-        var skew = new List<double>();
-        var orient = new List<double>();
-        for (int r = 0; r < runs; r++)
-        {
-            long t0 = Stopwatch.GetTimestamp();
-            NanoOcrEngine.EstimateSkew(gray);
-            skew.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
-            t0 = Stopwatch.GetTimestamp();
-            engine.Orientation(gray);
-            orient.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
-        }
-
+        // Sub-stages one at a time: best time of N and the allocation of one call.
         var (up, _, _) = engine.Upright(gray);
         var boxes = engine.Detect(up);
-        var crop = new List<double>();
-        var script = new List<double>();
-        var recog = new List<double>();
-        for (int r = 0; r < runs; r++)
+        var crops = boxes.Select(b => LineCrops.Crop(up, b, engine.Height)).ToList();
+        LineReading[] rec = engine.Recognize(up, boxes);
+        void Stage(string name, string note, Action body)
         {
-            long t0 = Stopwatch.GetTimestamp();
-            var crops = boxes.Select(b => LineCrops.Crop(up, b, engine.Height)).ToList();
-            crop.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
-            t0 = Stopwatch.GetTimestamp();
-            engine.HanziLines(crops);
-            script.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
-            t0 = Stopwatch.GetTimestamp();
-            engine.Recognize(up, boxes);
-            recog.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+            double best = double.MaxValue;
+            long alloc = long.MaxValue;
+            for (int r = 0; r < runs; r++)
+            {
+                long a0 = GC.GetAllocatedBytesForCurrentThread();
+                long t0 = Stopwatch.GetTimestamp();
+                body();
+                best = Math.Min(best, Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+                alloc = Math.Min(alloc, GC.GetAllocatedBytesForCurrentThread() - a0);
+            }
+
+            Console.WriteLine($"  {name,-10} best {best,8:0.0} ms  {alloc / 1048576.0,7:0.0} MiB   {note}");
         }
 
-        Console.WriteLine($"  {"crops",-10} best {crop.Min(),8:0.0} ms   ({boxes.Count} lines)");
-        Console.WriteLine($"  {"script",-10} best {script.Min(),8:0.0} ms");
-        Console.WriteLine($"  {"recognize",-10} best {recog.Min(),8:0.0} ms   (crops + script + recognizer)");
-        Console.WriteLine($"  {"skew",-10} best {skew.Min(),8:0.0} ms   (inside orient_ms)");
-        Console.WriteLine($"  {"orient",-10} best {orient.Min(),8:0.0} ms   (the model alone)");
+        Stage("skew", "(inside orient_ms)", () => NanoOcrEngine.EstimateSkew(gray));
+        Stage("orient", "(the model, inside orient_ms)", () => engine.Orientation(gray));
+        Stage("upright", "(orient_ms: model, skew, rotation)", () => engine.Upright(gray));
+        Stage("detect", "(det_ms)", () => engine.Detect(up));
+        Stage("crops", $"({boxes.Count} lines)", () => boxes.Select(b => LineCrops.Crop(up, b, engine.Height)).ToList());
+        Stage("script", "(the script model)", () => engine.HanziLines(crops));
+        Stage("recognize", "(rec_ms: crops + script + recognizer)", () => engine.Recognize(up, boxes));
+        Stage("assemble", "(order_ms)", () => engine.Assemble(up.Width, up.Height, boxes, rec, []));
         string[] models = (Environment.GetEnvironmentVariable("BENCH_MODELS") ?? "det,rec,order,orient,script,rec_cjk").Split(",");
         var profiles = models.ToDictionary(m => m, _ => new Dictionary<string, double>());
         foreach (string m in models)
