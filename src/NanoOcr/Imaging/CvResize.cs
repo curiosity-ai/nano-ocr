@@ -409,10 +409,34 @@ public static class CvResize
         }
     }
 
-    /// <summary><see cref="SaturateByte"/> over a row.</summary>
+    /// <summary>
+    /// <see cref="SaturateByte"/> over a row: round half to even, clamp to [0, 255] — eight lanes
+    /// at a time (the sums here are finite and far inside ±1e9, where the scalar's pre-clamp is moot).
+    /// </summary>
     private static void StoreBytes(ReadOnlySpan<float> sum, Span<byte> dst)
     {
-        for (int x = 0; x < dst.Length; x++)
+        int x = 0;
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var lo = Vector256<float>.Zero;
+            var hi = Vector256.Create(255f);
+            for (; x + 8 <= dst.Length; x += 8)
+            {
+                Vector256<float> v = Vector256.Create(sum.Slice(x, 8));
+                if (!Vector256.EqualsAll(v, v))
+                {
+                    break; // a NaN: the scalar path's rule
+                }
+
+                Vector256<int> r = Vector256.ConvertToInt32(Vector256.Min(hi, Vector256.Max(lo, Vector256.Round(v))));
+                for (int i = 0; i < 8; i++)
+                {
+                    dst[x + i] = (byte)r.GetElement(i);
+                }
+            }
+        }
+
+        for (; x < dst.Length; x++)
         {
             dst[x] = SaturateByte(sum[x]);
         }
