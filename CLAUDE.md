@@ -21,14 +21,16 @@ images; PDFium (native, via P/Invoke — the engine pypdfium2 wraps) renders PDF
 | `src/NanoOcr/Pipeline/LineCrops.cs` | `rec_preproc.py`, `line_mask.crop_lines` |
 | `src/NanoOcr/Pipeline/Vocab.cs` | `vocab.py` (the inference parts) |
 | `src/NanoOcr/Pipeline/ReadingOrder.cs` | `order_post.py` |
-| `src/NanoOcr/Pipeline/Layout.cs` | `layout_post.py` |
+| `src/NanoOcr/Pipeline/Layout.cs` | `layout_post.py` (blocks → `PageElement`s; `PageMarkdown` is `page_markdown`) |
+| `src/NanoOcr/Pipeline/MarkdownWriter.cs`, `MarkdownDocument.cs`, `TitleLevels.cs`, `TableMerger.cs` | not Indra: PaddleOCR's markdown (PaddleX `MarkdownConverter`, `assign_levels_to_parsing_res`, `merge_tables_across_pages`, as the sibling port PaddleOcrSharp has them) on NanoOCR's blocks |
 | `src/NanoOcr/Pipeline/MathReader.cs` | `math.py` |
 | `src/NanoOcr/Pipeline/TextLayer.cs` | `textlayer.py` |
 | `src/NanoOcr/Pipeline/DocumentConverter.cs` | `document.py` |
 | `src/NanoOcr/Pipeline/NanoOcrEngine.cs` | `pipeline.py` (`OrtOCR`, deskew, orientation) |
 | `src/NanoOcr/Pipeline/Py.cs` | Python/numpy semantics (see below) |
 | `src/NanoOcr/NanoOCR.cs`, `OcrResult.cs` | `__init__.load`, `parallel.convert_many`; the PaddleOCR-style API |
-| `src/NanoOcr.Cli/` | `cli.py` (`indra-ocr`; here `nano-ocr`), plus `bench` and `bench-gemm` |
+| `src/NanoOcr/Routing/` | not Indra: `PageClassifier` (category from a page's reading; calibrated on RVL-CDIP, figures in its doc comment) and `PageRouter<TOutput>` (category → recognizer, generic on the output) |
+| `src/NanoOcr.Cli/` | `cli.py` (`indra-ocr`; here `nano-ocr`), plus `classify`, `bench` and `bench-gemm` |
 | `src/NanoOcr/Models/Assets/` | the `v3.1` models of `datalab-to/indra-ocr`, embedded as resources (hashes in its README) |
 
 Not ported: `viewer.py` (a local web viewer), `bench/opb_indra.py` (OmniParseBench harness), the
@@ -70,12 +72,20 @@ helpers (`encode_targets`, vocabulary builders, label canonicalization).
   INTER_AREA row sum and the summed-area table's first row are the examples in the code).
 - Read the Python for a stage before writing the C#, and name the Python function in the doc
   comment.
+- **The markdown is PaddleOCR's, on purpose.** The default `MarkdownStyle.PaddleOcr` writes what
+  PaddleOCR's document parser writes (the sibling port `curiosity-ai/PaddleOCR`, `dotnet/`, is the
+  reference for that format), so the two engines' output is interchangeable; it is byte-identical
+  to PaddleOCR-VL 1.6's on the corpus pages where both read the same text. `MarkdownStyle.Reference`
+  is `page_markdown` byte for byte, and it is what `PipelineParityTests` pins — both styles render
+  the same `PageElement`s, so a change to how blocks are built shows in the parity tests, and a
+  change to the PaddleOCR style shows in `MarkdownTests`. The document-level passes (title, title
+  levels, table merging) run in `MarkdownDocument.Finish`, which `NanoOCR` applies per file.
 
 ## Validation
 
 See the README's *Validation* section and [`tools/reference/README.md`](tools/reference/README.md).
 Any change to a kernel, an image operation or a pipeline stage must keep all of
-`LayerParityTests`, `ImagingParityTests`, `PipelineParityTests` and `UnitTests` green with the
+`LayerParityTests`, `ImagingParityTests`, `PipelineParityTests`, `MarkdownTests` and `UnitTests` green with the
 fixtures generated; a change that moves an output must say why.
 
 ## Building and testing
@@ -123,7 +133,7 @@ and 165 at 512, DRAM ~11 GB/s, jitter 12-50% — 1700×2200 page (`page_two_colu
 | | C# before this work | C# now | Python + ORT 1.31 |
 | --- | --- | --- | --- |
 | page, 1 thread | 452-510 ms | **214-230 ms** | 281-290 ms |
-| page, 4 threads | 297-326 ms | **157-168 ms** | 277-327 ms |
+| page, 4 threads | 297-326 ms | **157-168 ms**, then **106-128 ms** (below) | 277-327 ms |
 | allocation per warm page | 37 MiB, GC every page | **8 MiB, no GC** | — |
 
 Stage by stage, 1 thread: orientation + deskew 98-102 → 41-44 ms, detection 112-116 → 54-57,
@@ -136,7 +146,58 @@ against OpenCV, every line, token and markdown identical. The CLI's markdown for
 `tests/data/documents` (images, PDFs, TIFFs, with and without `--math`) is byte-identical between
 the build before this work and now.
 
-### What moved it
+Against Python + ORT once more after the multi-threaded work (2026-10-14, same VM, best of 7 warm,
+two interleaved rounds, total page time):
+
+| page | Python 1 thread | C# 1 thread | Python 4 threads | C# 4 threads |
+| --- | --- | --- | --- | --- |
+| two-column 1700×2200 | 267-269 ms | 205-210 ms | 290-372 ms | 118 ms |
+| skewed | 241-272 ms | 220 ms | 265-293 ms | 117-131 ms |
+| Chinese | 85-87 ms | 81 ms | 176-189 ms | 46-48 ms |
+| math (`--math` off) | 72-74 ms | 73 ms | 145-148 ms | 42-49 ms |
+
+On one thread the small pages (a few lines) are at parity — their time is the orientation and
+detection models, where ORT's MLAS and this GEMM are about even — and the full pages 1.2-1.3×
+faster. At four threads Python's `OrtOCR(threads=4)` is slower than its own single thread on this
+VM, so the gap there is 2.5-4×.
+
+### Multi-threaded
+
+This VM's four vCPUs together sustain only ~2.2-2.8× the single-thread FMA rate (the machine
+header's "all threads" figure), so that is the ceiling for any stage. Before this round, at 4
+threads, detection scaled 1.9× and orientation 2.2×, but recognition 1.15× (115 → ~96-100 ms): its
+seven width batches ran one after another, and each spread ~80 small operators over every
+thread — the small batches gained nothing and the big ones ~1.8×. Measured interleaved against
+`main` in one sitting, 1700×2200 page, best of 7:
+
+| | `main` | now |
+| --- | --- | --- |
+| page, 4 threads | 138-157 ms | **106-128 ms** |
+| page, 1 thread | 210-223 ms | 209-219 ms (unchanged, as intended) |
+| recognition, 4 threads | 84-100 ms | 47-57 ms |
+
+What moved it (outputs unchanged: the CLI's markdown for all 24 test files at 1 and 4 cores, with
+and without `--math`, is byte-identical to `main`):
+
+- **`Parallelism.Jobs`**: independent jobs of different sizes run at once, largest first, up to
+  `Workers` at a time, each with a kernel degree proportional to its share of the work (at least
+  one). The recognizers' and the script model's width batches use it, so one dominant batch still
+  gets every thread and many similar ones get one each. Line crops run in parallel too. Inside a
+  batch every kernel computes the same chains whichever thread runs it.
+- **Orientation and deskew overlap**: with more than one worker, the skew is estimated on the page
+  as given while the orientation model runs; a page the model turns is deskewed again after the
+  turn (same result either way). Upright pages: orientation + deskew 20-22 → ~18 ms at 4 threads;
+  a turned page pays for the discarded estimate.
+
+The bench now reports **cores busy** (process CPU time over wall time) for the timed pages and for
+each sub-stage. At 4 threads a warm page keeps ~2.4 cores busy — recognition 2.5, the upright
+stage 2.5, the script model 2.8, detection 1.9 — against the 2.1-2.8× this VM's four vCPUs deliver
+when all are loaded, and the CPU time per page rises from ~200 core-ms on one thread to ~240 on
+four. Warm multi-threaded time is therefore close to this machine's ceiling, and the remaining lever
+is doing less work per page, not filling more cores. (Cold start is out of scope: only warm
+throughput is measured and optimised.)
+
+### What moved it (single thread)
 
 In the order they landed; each is its own commit with its measurement.
 
@@ -219,6 +280,18 @@ folding.
 - **Banding the multi-filter stem depthwise** (all sixteen filters over a band of rows before the
   next): neutral (5.5 → 5.1 ms). The stem is bound by writing its 13 MB output, not by reading its
   input. Kept as harmless.
+- **Rounding `Parallelism.Jobs` shares up** (`ceiling` instead of `round`, so the second-largest
+  batch gets two threads rather than one): recognition 47-58 ms against 44-56, no separation in
+  three interleaved rounds. Kept `round`, which oversubscribes less.
+- **Parallelizing detection's serial edges** (the ink map of the detector input by rows, decode's
+  sigmoid and threshold by element — both order-independent) together with **handing a finished
+  batch's threads to the batches still running** in `Parallelism.Jobs` (each job's
+  `ParallelOptions` is re-read at every kernel region): 4 threads, interleaved, 96-120 ms before
+  against 94-108 after, cores busy 2.4 either way. Within noise on a machine at its ceiling;
+  reverted to keep the code simple.
+- **Smaller late layers of the orientation model** still scale poorly (17.8 → 13.4 ms at 4
+  threads): at 96×96 and 48×48 the parallel regions cost about what they save. Overlapping the
+  model with the deskew estimate was the better use of the threads.
 - **A cache-blocked quarter turn** with pointer writes: 5.9 → 5.1 ms — mostly the 3.7 MB result's
   allocation and first touch. Kept, small.
 

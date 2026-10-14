@@ -9,7 +9,7 @@ using NanoOcr.Pipeline;
 //   nano-ocr paper.pdf                    # markdown to stdout
 //   nano-ocr *.pdf --out results/         # one .md per input
 //   nano-ocr scan.png --format json       # lines with boxes, confidences, timings
-return args.Length > 0 && args[0] == "bench" ? Bench.Run(args[1..]) : args.Length > 0 && args[0] == "bench-gemm" ? GemmBench.Run(args[1..]) : Cli.Run(args);
+return args.Length > 0 && args[0] == "bench" ? Bench.Run(args[1..]) : args.Length > 0 && args[0] == "classify" ? Classify.Run(args[1..]) : args.Length > 0 && args[0] == "bench-gemm" ? GemmBench.Run(args[1..]) : Cli.Run(args);
 
 internal static class Cli
 {
@@ -28,6 +28,13 @@ internal static class Cli
           --max-pages N         read at most N pages per file
           --password PW         password of encrypted PDFs
           --keep-furniture      keep page headers and footers in the markdown
+          --md-style paddleocr|reference
+                                paddleocr: the markdown PaddleOCR writes (default); reference: the
+                                Python original's (layout_post.page_markdown), byte for byte
+          --plain               PaddleOCR's plain variant: no table styles, captions as text
+          --merge-tables        rejoin tables split across a page break
+          --title-levels        set heading depth from the whole document (numbering and size)
+          --no-doc-title        do not write the document's opening heading as its title (#)
           --math                write math as LaTeX ($...$); slower on pages with math
           --no-orientation      do not turn pages upright with the orientation model
           --table-heads         build tables from the order model's table heads, not geometry
@@ -79,6 +86,21 @@ internal static class Cli
                     case "--max-pages": maxPages = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--password": password = Next(); break;
                     case "--keep-furniture": options.Furniture = true; break;
+                    case "--md-style":
+                        options.Markdown = options.Markdown with
+                        {
+                            Style = Next() switch
+                            {
+                                "paddleocr" => MarkdownStyle.PaddleOcr,
+                                "reference" => MarkdownStyle.Reference,
+                                var m => throw new ArgumentException($"--md-style must be paddleocr or reference, not {m}"),
+                            },
+                        };
+                        break;
+                    case "--plain": options.Markdown = options.Markdown with { Pretty = false }; break;
+                    case "--merge-tables": options.Markdown = options.Markdown with { MergeTables = true }; break;
+                    case "--title-levels": options.Markdown = options.Markdown with { TitleLevels = true }; break;
+                    case "--no-doc-title": options.Markdown = options.Markdown with { DocTitle = false }; break;
                     case "--math": options.Math = true; break;
                     case "--no-orientation": options.UseDocOrientationClassify = false; break;
                     case "--table-heads": options.TableHeads = true; break;

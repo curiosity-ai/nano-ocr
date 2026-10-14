@@ -73,6 +73,7 @@ foreach (var (path, pages, error) in ocr.PredictMany(files, cores: 8))
 | `ModelDir` | embedded | a folder laid out like the Hugging Face repository instead |
 | `KeepImages` | false | keep page images on the results (for `SaveToImg`) |
 | `Fusion` | true | run the models with element-wise nodes fused into the convolutions; false runs the graphs as written (same results, slower) |
+| `Markdown` | `MarkdownOptions.Default` | the markdown flavour and the document-level passes (see [Markdown](#markdown)) |
 
 Everything is configured in code (or, for `nano-ocr`, with command-line arguments: `nano-ocr --help`);
 nothing reads environment variables.
@@ -94,6 +95,9 @@ nano-ocr paper.pdf --math                # write math as LaTeX
 nano-ocr scan.png --no-orientation       # the page is known to be upright
 nano-ocr scan.png --no-fusion --gemm-256 # graphs as written, 256-bit kernels (A/B; same output)
 nano-ocr scan.png --save-img out/        # draw blocks and lines over the page
+nano-ocr paper.pdf --merge-tables --title-levels   # rejoin split tables, heading depth from the document
+nano-ocr paper.pdf --md-style reference  # the Python original's markdown, byte for byte
+nano-ocr classify *.pdf                  # each page's category and signals (see Routing pages)
 nano-ocr bench page.png                  # warm stage timings, per-operator profile
 ```
 
@@ -104,6 +108,85 @@ Each page (`OcrResult.Page`) has `Lines` (box, text, confidence, in reading orde
 `Footnote`, `Table-Of-Contents`, `Form`), `Markdown` (headings, paragraphs, lists, tables as HTML),
 `Source` (`ocr`, `text`, `hybrid` or `error`), `Rotation`, `Skew`, `Timings` and `Note` — the
 fields of the Python `Page`, and `ToJson()` writes the Python CLI's JSON layout.
+
+### Markdown
+
+By default the markdown is written the way PaddleOCR's document parser writes it (PaddleX's
+`MarkdownConverter`, as [PaddleOcrSharp](https://github.com/curiosity-ai/PaddleOCR/tree/main/dotnet)
+reproduces it), so the output of the two engines can be consumed the same way:
+
+| | PaddleOCR style (default) | `--md-style reference` (the Python original) |
+| --- | --- | --- |
+| document title | `# Title` — the opening heading of the first page, when its text is ≥1.25× every other heading's | `## Title` |
+| headings | depth from the numbering: `## Results`, `### 1. Introduction`, `#### 1.2.3 Detail` | `## ` always |
+| tables | one line of HTML, every cell `<td>`, border and centring styles, after an empty line | `<table>`, one `<tr>` per line, header row in `<th>` |
+| lists | items separated by a blank line | one item per line |
+| captions | centred in a `<div>` | plain paragraph |
+
+On the test corpus (`page_two_column.png`, `scanned.pdf`, `digital.pdf`, …) the default output is
+byte-identical to PaddleOCR-VL 1.6's wherever the two read the same text. Two things stay NanoOCR's
+own because they are content rather than format: inline math is `$…$` (PaddleOCR pads it to
+`␣$ … $`, which not every renderer reads as math), and what each model reads.
+
+`MarkdownOptions` (and the CLI flags) also carry PaddleOCR's document-level passes, ported onto
+NanoOCR's layout blocks:
+
+| Option | CLI | |
+| --- | --- | --- |
+| `Pretty` = false | `--plain` | PaddleOCR's plain variant: unstyled tables, captions as text |
+| `MergeTables` | `--merge-tables` | rejoin a table split by a page break (`MergeTablesAcrossPages`): the last table of a page and the first of the next, with only page furniture or footnotes between, widths within 10%, and the same columns; a repeated header is dropped |
+| `TitleLevels` | `--title-levels` | heading depth from the whole document (`AssignTitleLevels`): the numbering's depth, the numbering style's first appearance and the text size ranked among all headings, two of three deciding; section names (Abstract, References, …) are level one |
+| `DocTitle` = false | `--no-doc-title` | never write the opening heading as the title |
+
+With `MergeTables` or `TitleLevels`, `NanoOCR.Predict` returns a file's pages once its last page is
+done. A caller driving `NanoOcrEngine` or `DocumentConverter` directly calls
+`MarkdownDocument.Finish(pages, options)` on a document's pages for the same result.
+
+## Routing pages
+
+`PageRouter<TOutput>` reads each page with NanoOCR, sorts it into a `PageCategory` —
+`PrintedText`, `Handwritten`, `TableOrComplex` or `Mixed` — and hands it to the recognizer
+registered for that category, falling back to a default. It is generic on the output, so
+NanoOCR's own reading and another engine (PaddleOCR-VL, say) can share it through a conversion of
+their results:
+
+```csharp
+using var nano = new NanoOCR(new NanoOcrOptions { KeepImages = true });
+var router = new PageRouter<string>(nano)
+    .When(PageCategory.PrintedText, page => page.Ocr.Markdown)          // NanoOCR's reading is the answer
+    .When(c => c.Signals.Tables > 2, page => VlMarkdown(page))          // predicates refine; first match wins
+    .When(PageCategory.Handwritten, page => VlMarkdown(page))
+    .Otherwise(page => VlMarkdown(page));                               // TableOrComplex, Mixed, …
+
+foreach (RoutedResult<string> r in router.Route("scans/batch.pdf"))
+    Console.WriteLine($"page {r.Page.PageIndex + 1}: {r.Page.Category} ({r.Page.Classification.Reason})");
+```
+
+A recognizer gets a `RoutedPage`: NanoOCR's `OcrResult` (the page image on it when `KeepImages`
+is on), the input path and page index (or the bytes, for `Route(byte[])`), and the
+classification. Asynchronous recognizers (`(page, ct) => ValueTask<T>`) go through the same
+`When`/`Otherwise`, with `RouteAsync` returning an `IAsyncEnumerable`. Routes are tried in the
+order they were added; with no `Otherwise`, a page no route takes throws.
+
+The default classifier (`PageClassifier`) needs no model of its own — it decides from the reading
+NanoOCR already made, so classifying costs nothing more than reading the page (~0.1-0.2 s):
+
+| Category | Rule (every figure relative to the page, so independent of resolution) |
+| --- | --- |
+| `Mixed` | fewer than 3 lines, or a failed page |
+| `Handwritten` | most lines unread (≥45% below 0.6 confidence, mean < 0.75) — the recognizer is trained on print — **and** written large (median line ≥1.2% of the page height) or in long strokes (≥8% of lines wider than a quarter of the page); never a PDF text layer |
+| `Mixed` | mostly unread, in small type: degraded print, a fax, noise |
+| `TableOrComplex` | ≥25% of the lines in the order model's `Table` or `Form` blocks |
+| `Mixed` | printed, but mean confidence < 0.85 or ≥35% of lines unread |
+| `PrintedText` | everything else |
+
+It was calibrated on 160 RVL-CDIP pages and checked on 400 others (fax-quality 1990s scans, the
+hard case). On the 400 it finds 80% of the handwritten pages, and 56% of its handwriting calls are
+right (large-type adverts make up most of the rest); 83% of its printed calls are printed. **It
+never called a handwritten page printed** — the one error that would hand a page NanoOCR cannot
+read to NanoOCR. The thresholds are `PageClassifierOptions`; a trained classifier plugs in through
+`new PageRouter<T>(nano, result => …)`, and `nano-ocr classify` prints every signal per page for
+tuning on your own documents.
 
 ## Validation
 
@@ -116,7 +199,7 @@ produced on demand rather than committed, and the tests that need them skip when
 | --- | --- | --- |
 | `LayerParityTests` | every node output of all 10 models (1,857 tensors) vs ONNX Runtime | all within tolerance (worst at 7% of it); CTC ids and lengths exact |
 | `ImagingParityTests` | resize (linear, area, fast area), warpAffine 8-bit and float, connected components, PNG gray decode, TIFF in 7 compressions vs OpenCV | **byte-exact**, 54 cases |
-| `PipelineParityTests` | orientation, deskewed page, boxes, per-line text/confidence/tokens, final pages; PDF renders and text layers; auto and OCR modes; math | upright pages byte-identical, boxes within 1e-4 px, every line and token identical, **markdown identical** on every page |
+| `PipelineParityTests` | orientation, deskewed page, boxes, per-line text/confidence/tokens, final pages; PDF renders and text layers; auto and OCR modes; math | upright pages byte-identical, boxes within 1e-4 px, every line and token identical, **markdown identical** on every page (in the reference style) |
 | `UnitTests` | the Python package's own unit tests, ported | pass |
 
 ```shell
@@ -136,15 +219,17 @@ samples are normal on this machine):
 | | Python + ONNX Runtime 1.31 | C# |
 | --- | --- | --- |
 | one page, 1 thread | 281-290 ms | 214-230 ms |
-| one page, 4 threads | 277-327 ms | 157-168 ms |
+| one page, 4 threads | 277-327 ms | 106-128 ms |
 | allocation per warm page | — | 8 MiB, no GC |
 
-The C# figures are about twice as fast as this port was before its optimisation pass (452-510 ms
-on one thread, 297-326 on four, same sitting): 512-bit GEMM kernels, graph fusion (activation,
+The C# figures are two to three times as fast as this port was before its optimisation passes
+(452-510 ms on one thread, 297-326 on four, same sitting). Single-threaded: 512-bit GEMM kernels, graph fusion (activation,
 residual, squeeze-excite gate and sequence mask folded into the convolutions; the CTC head's
 softmax peak fused with its convolution), rewritten depthwise and pooling kernels, a deskew search
 that skips what it can prove is blank, vectorized OpenCV ports, and pooled buffers — with every
-model output, image byte and markdown line unchanged. `nano-ocr bench page.png --threads 1` prints
+model output, image byte and markdown line unchanged. Multi-threaded, the recognizer's width
+batches run concurrently with thread shares proportional to their size, and the deskew estimate
+overlaps the orientation model. `nano-ocr bench page.png --threads 1` prints
 a machine header (CPU, ISA, FMA and bandwidth ceilings, jitter) before its stage timings. Details,
 and the experiments that did not pay, are in [`CLAUDE.md`](CLAUDE.md).
 

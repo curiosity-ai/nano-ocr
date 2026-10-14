@@ -74,6 +74,8 @@ internal static class Bench
         var samples = new Dictionary<string, List<double>>();
 
         long alloc0 = GC.GetTotalAllocatedBytes(precise: true);
+        TimeSpan cpu0 = Process.GetCurrentProcess().TotalProcessorTime;
+        long wall0 = Stopwatch.GetTimestamp();
         int gc0 = GC.CollectionCount(0), gc2 = GC.CollectionCount(2);
         TimeSpan pause0 = GC.GetTotalPauseDuration();
         for (int r = 0; r < runs; r++)
@@ -89,6 +91,8 @@ internal static class Bench
             (samples.TryGetValue("wall_ms", out var w) ? w : samples["wall_ms"] = []).Add(wall);
         }
 
+        double busy = (Process.GetCurrentProcess().TotalProcessorTime - cpu0).TotalMilliseconds / Stopwatch.GetElapsedTime(wall0).TotalMilliseconds;
+        Console.WriteLine($"cores busy {busy:0.00} on average over the timed pages ({threads} threads)");
         Console.WriteLine($"allocated {(GC.GetTotalAllocatedBytes(precise: true) - alloc0) / runs / 1048576.0:0} MiB per run; GCs gen0 {GC.CollectionCount(0) - gc0}, gen2 {GC.CollectionCount(2) - gc2}; GC pause {(GC.GetTotalPauseDuration() - pause0).TotalMilliseconds / runs:0.0} ms per run");
         Console.WriteLine($"{path}: {gray.Width}x{gray.Height}, {threads} threads, best of {runs} warm runs");
         foreach (var (k, v) in samples)
@@ -103,18 +107,22 @@ internal static class Bench
         LineReading[] rec = engine.Recognize(up, boxes);
         void Stage(string name, string note, Action body)
         {
-            double best = double.MaxValue;
+            double best = double.MaxValue, cpu = 0, wall = 0;
             long alloc = long.MaxValue;
             for (int r = 0; r < runs; r++)
             {
                 long a0 = GC.GetAllocatedBytesForCurrentThread();
+                TimeSpan c0 = Process.GetCurrentProcess().TotalProcessorTime;
                 long t0 = Stopwatch.GetTimestamp();
                 body();
-                best = Math.Min(best, Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+                double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                best = Math.Min(best, ms);
+                wall += ms;
+                cpu += (Process.GetCurrentProcess().TotalProcessorTime - c0).TotalMilliseconds;
                 alloc = Math.Min(alloc, GC.GetAllocatedBytesForCurrentThread() - a0);
             }
 
-            Console.WriteLine($"  {name,-10} best {best,8:0.0} ms  {alloc / 1048576.0,7:0.0} MiB   {note}");
+            Console.WriteLine($"  {name,-10} best {best,8:0.0} ms  {alloc / 1048576.0,7:0.0} MiB  {cpu / wall,5:0.00} cores   {note}");
         }
 
         Stage("thumbnail", "(INTER_AREA to the 800-px deskew thumbnail)", () => CvResize.Resize(gray, (int)Math.Round(gray.Width * 800.0 / Math.Max(gray.Width, gray.Height)), (int)Math.Round(gray.Height * 800.0 / Math.Max(gray.Width, gray.Height)), Interpolation.Area));

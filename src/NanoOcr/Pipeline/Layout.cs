@@ -18,6 +18,7 @@ public static partial class Layout
     private static readonly int Section = Array.IndexOf(ReadingOrder.BlockClasses, "Section-Header");
     private static readonly int ListGroup = Array.IndexOf(ReadingOrder.BlockClasses, "List-Group");
     private static readonly int Table = Array.IndexOf(ReadingOrder.BlockClasses, "Table");
+    private static readonly int Caption = Array.IndexOf(ReadingOrder.BlockClasses, "Caption");
 
     [GeneratedRegex(@"^\$[^$]+\$$")]
     private static partial Regex WholeMath();
@@ -221,6 +222,17 @@ public static partial class Layout
     /// </summary>
     public static string TableHtml(IReadOnlyList<LineBox> boxes, IReadOnlyList<string> texts)
     {
+        var titles = new List<string>();
+        TableGrid grid = TableGridOf(boxes, texts, titles);
+        return MarkdownWriter.ReferenceTable(titles, grid);
+    }
+
+    /// <summary>
+    /// The cell grid of <see cref="TableHtml"/>; title rows lifted out of the table are appended
+    /// to <paramref name="titles"/>.
+    /// </summary>
+    public static TableGrid TableGridOf(IReadOnlyList<LineBox> boxes, IReadOnlyList<string> texts, List<string> titles)
+    {
         List<List<int>> rows = Rows(boxes);
         float spanX = boxes.Max(b => b.X1) - boxes.Min(b => b.X0);
         if (rows.Count > 2 && rows[0].Count == 1 && rows.Max(r => r.Count) > 1
@@ -228,7 +240,8 @@ public static partial class Layout
         {
             int title = rows[0][0];
             var keep = Enumerable.Range(0, texts.Count).Where(k => k != title).ToList();
-            return texts[title] + "\n\n" + TableHtml(keep.Select(k => boxes[k]).ToList(), keep.Select(k => texts[k]).ToList());
+            titles.Add(texts[title]);
+            return TableGridOf(keep.Select(k => boxes[k]).ToList(), keep.Select(k => texts[k]).ToList(), titles);
         }
 
         int width = rows.Max(r => r.Count);
@@ -249,10 +262,9 @@ public static partial class Layout
         }
 
         edges[width] = double.PositiveInfinity;
-        var html = new List<string> { "<table>" };
+        var gridRows = new List<TableRow>();
         for (int ri = 0; ri < rows.Count; ri++)
         {
-            string tag = ri == 0 && rows.Count > 1 ? "th" : "td";
             var cells = new Dictionary<int, (int Span, string Text)>();
             foreach (int k in rows[ri].OrderBy(k => boxes[k].Y0).ThenBy(k => boxes[k].X0))
             {
@@ -284,29 +296,40 @@ public static partial class Layout
                 }
             }
 
-            var tds = new StringBuilder();
-            int col = 0;
-            while (col < width)
-            {
-                if (cells.TryGetValue(col, out var cell))
-                {
-                    string attr = cell.Span > 1 ? $" colspan=\"{cell.Span}\"" : "";
-                    tds.Append($"<{tag}{attr}>{Py.HtmlEscape(cell.Text)}</{tag}>");
-                    col += cell.Span;
-                }
-                else
-                {
-                    tds.Append($"<{tag}></{tag}>");
-                    col++;
-                }
-            }
-
-            html.Add("<tr>" + tds + "</tr>");
+            gridRows.Add(GridRow(cells, width, ri == 0 && rows.Count > 1));
         }
 
-        html.Add("</table>");
-        return string.Join("\n", html);
+        return new TableGrid(width, gridRows);
     }
+
+    /// <summary>
+    /// One row of the grid: the cells placed at their first column, an empty cell for every column
+    /// no cell starts at or spans (the loop both <c>table_html</c> functions end with).
+    /// </summary>
+    private static TableRow GridRow(Func<int, (bool Found, int Span, string Text)> cellAt, int width, bool header)
+    {
+        var cells = new List<TableCell>();
+        int col = 0;
+        while (col < width)
+        {
+            var (found, span, text) = cellAt(col);
+            if (found)
+            {
+                cells.Add(new TableCell(text, span));
+                col += span;
+            }
+            else
+            {
+                cells.Add(new TableCell(""));
+                col++;
+            }
+        }
+
+        return new TableRow(cells, header);
+    }
+
+    private static TableRow GridRow(Dictionary<int, (int Span, string Text)> cells, int width, bool header) =>
+        GridRow(c => cells.TryGetValue(c, out var v) ? (true, v.Span, v.Text) : (false, 0, ""), width, header);
 
     /// <summary><c>np.searchsorted(a, v, side="right")</c>.</summary>
     private static int SearchSortedRight(double[] a, double v)
@@ -382,7 +405,11 @@ public static partial class Layout
     }
 
     /// <summary><c>table_html_heads</c>: an HTML table from the order model's row / column / cell heads.</summary>
-    public static string TableHtmlHeads(IReadOnlyList<LineBox> boxes, IReadOnlyList<string> texts, float[] tab)
+    public static string TableHtmlHeads(IReadOnlyList<LineBox> boxes, IReadOnlyList<string> texts, float[] tab) =>
+        MarkdownWriter.ReferenceTable([], TableGridHeads(boxes, texts, tab));
+
+    /// <summary>The cell grid of <see cref="TableHtmlHeads"/>.</summary>
+    public static TableGrid TableGridHeads(IReadOnlyList<LineBox> boxes, IReadOnlyList<string> texts, float[] tab)
     {
         int n = boxes.Count;
         List<List<int>> cells = ReadingOrder.Cluster(tab.AsSpan(2 * n * n, n * n).ToArray(), n);
@@ -451,32 +478,17 @@ public static partial class Layout
             grid[key] = grid.TryGetValue(key, out var prev) ? (Math.Max(prev.Span, span), prev.Text + " " + ctext[c]) : (span, ctext[c]);
         }
 
-        var html = new List<string> { "<table>" };
+        var gridRows = new List<TableRow>();
         for (int r = 0; r < rows.Count; r++)
         {
-            string tag = r == 0 && rows.Count > 1 ? "th" : "td";
-            var tds = new StringBuilder();
-            int col = 0;
-            while (col < cols.Count)
-            {
-                if (grid.TryGetValue((r, col), out var cell))
-                {
-                    string attr = cell.Span > 1 ? $" colspan=\"{cell.Span}\"" : "";
-                    tds.Append($"<{tag}{attr}>{Py.HtmlEscape(cell.Text)}</{tag}>");
-                    col += cell.Span;
-                }
-                else
-                {
-                    tds.Append($"<{tag}></{tag}>");
-                    col++;
-                }
-            }
-
-            html.Add("<tr>" + tds + "</tr>");
+            int row = r;
+            gridRows.Add(GridRow(
+                c => grid.TryGetValue((row, c), out var v) ? (true, v.Span, v.Text) : (false, 0, ""),
+                cols.Count,
+                r == 0 && rows.Count > 1));
         }
 
-        html.Add("</table>");
-        return string.Join("\n", html);
+        return new TableGrid(cols.Count, gridRows);
     }
 
     /// <summary><c>page_blocks</c>: the layout blocks behind <see cref="PageMarkdown"/>, in reading order.</summary>
@@ -504,7 +516,8 @@ public static partial class Layout
     /// <summary>
     /// <c>page_markdown</c>: markdown for one page. Section headers become <c>## </c>, tables HTML,
     /// lists one item per line, everything else a paragraph; page headers and footers are dropped
-    /// unless <paramref name="keepFurniture"/>.
+    /// unless <paramref name="keepFurniture"/>. Identical to the Python; see
+    /// <see cref="MarkdownWriter"/> for the PaddleOCR-style rendering of the same blocks.
     /// </summary>
     public static string PageMarkdown(
         IReadOnlyList<LineBox> boxes,
@@ -514,38 +527,55 @@ public static partial class Layout
         float[] same,
         bool keepFurniture = false,
         IReadOnlyDictionary<int, List<(LineBox Box, string Text)>>? cells = null,
+        float[]? tab = null) =>
+        MarkdownWriter.Reference(PageElements(boxes, texts, order, cls, same, cells, tab), keepFurniture);
+
+    /// <summary>
+    /// The blocks of <see cref="PageMarkdown"/>, each with the decisions <c>page_markdown</c>
+    /// takes about it — class, whole-math test, table cells, list items — before any markup.
+    /// </summary>
+    public static List<PageElement> PageElements(
+        IReadOnlyList<LineBox> boxes,
+        IReadOnlyList<string> texts,
+        IReadOnlyList<int> order,
+        float[] cls,
+        float[] same,
+        IReadOnlyDictionary<int, List<(LineBox Box, string Text)>>? cells = null,
         float[]? tab = null)
     {
         int n = boxes.Count;
         int classes = ReadingOrder.BlockClasses.Length;
-        var parts = new List<string>();
+        var elements = new List<PageElement>();
         foreach (List<int> blk in SplitBlocks(order, same, n))
         {
             int cls0 = ReadingOrder.BlockClass(cls, classes, blk);
             var textsB = blk.Select(i => texts[i]).ToList();
-            if ((cls0 == Header || cls0 == Footer) && !keepFurniture)
+            var element = new PageElement
             {
-                continue;
-            }
+                Label = ReadingOrder.BlockClasses[cls0],
+                Furniture = cls0 == Header || cls0 == Footer,
+                Lines = textsB,
+                Box = [blk.Min(i => boxes[i].X0), blk.Min(i => boxes[i].Y0), blk.Max(i => boxes[i].X1), blk.Max(i => boxes[i].Y1)],
+                LineHeight = Py.Median(blk.Select(i => boxes[i].Y1 - boxes[i].Y0).ToArray()),
+            };
 
             if (textsB.All(t => WholeMath().IsMatch(Py.Strip(t))))
             {
-                parts.Add(string.Join("\n", textsB.Select(t =>
+                elements.Add(Copy(element, ElementKind.Equation, text: string.Join("\n", textsB.Select(t =>
                 {
                     int[] cp = Py.CodePoints(Py.Strip(t));
                     return "$$" + Py.FromCodePoints(cp[1..^1]) + "$$";
-                })));
-                continue;
+                }))));
             }
-
-            if (cls0 == Section)
+            else if (cls0 == Section)
             {
-                parts.Add("## " + JoinLines(textsB));
+                elements.Add(Copy(element, ElementKind.Heading, text: JoinLines(textsB)));
             }
             else if (cls0 == Table && blk.Count > 1 && tab is not null
                 && HeadsPlausible(blk.Select(i => boxes[i]).ToList(), SubTab(tab, n, blk)))
             {
-                parts.Add(TableHtmlHeads(blk.Select(i => boxes[i]).ToList(), textsB, SubTab(tab, n, blk)));
+                TableGrid grid = TableGridHeads(blk.Select(i => boxes[i]).ToList(), textsB, SubTab(tab, n, blk));
+                elements.Add(Copy(element, ElementKind.Table, table: grid));
             }
             else if (cls0 == Table && blk.Count > 1)
             {
@@ -568,7 +598,9 @@ public static partial class Layout
                     }
                 }
 
-                parts.Add(TableHtml(cb, ct));
+                var titles = new List<string>();
+                TableGrid grid = TableGridOf(cb, ct, titles);
+                elements.Add(Copy(element, ElementKind.Table, table: grid, titles: titles));
             }
             else if (cls0 == ListGroup)
             {
@@ -585,14 +617,34 @@ public static partial class Layout
                     }
                 }
 
-                parts.Add(string.Join("\n", items.Select(JoinLines)));
+                elements.Add(Copy(element, ElementKind.List, items: items.Select(JoinLines).ToList()));
             }
             else
             {
-                parts.Add(JoinLines(textsB));
+                elements.Add(Copy(element, cls0 == Caption ? ElementKind.Caption : ElementKind.Paragraph, text: JoinLines(textsB)));
             }
         }
 
-        return string.Join("\n\n", parts.Where(p => p.Length > 0));
+        return elements;
     }
+
+    private static PageElement Copy(
+        PageElement e,
+        ElementKind kind,
+        string text = "",
+        IReadOnlyList<string>? items = null,
+        TableGrid? table = null,
+        IReadOnlyList<string>? titles = null) => new()
+        {
+            Label = e.Label,
+            Kind = kind,
+            Furniture = e.Furniture,
+            Lines = e.Lines,
+            Box = e.Box,
+            LineHeight = e.LineHeight,
+            Text = text,
+            Items = items ?? [],
+            Table = table,
+            TableTitles = titles ?? [],
+        };
 }
