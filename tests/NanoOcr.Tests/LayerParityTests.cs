@@ -72,6 +72,36 @@ public class LayerParityTests(ITestOutputHelper output)
     }
 
     /// <summary>
+    /// The fused graph (convolutions with their activation and residual folded in) produces exactly
+    /// the unfused graph's outputs: fusion moves work, it must not change arithmetic.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Models))]
+    public void FusedGraphEqualsUnfused(string model)
+    {
+        string npz = Path.Combine(TestData.Layers, model + ".npz");
+        Assert.SkipUnless(File.Exists(npz), $"Reference dump {npz} missing; run tools/reference/dump_layers.py.");
+        Dictionary<string, Tensor> arrays = Npz.Load(npz);
+        using JsonDocument names = JsonDocument.Parse(File.ReadAllText(Path.Combine(TestData.Layers, model + ".json")));
+        string[] inputs = names.RootElement.GetProperty("inputs").EnumerateArray().Select(e => e.GetString()!).ToArray();
+        var feed = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            feed[inputs[i]] = arrays[$"in.{i}"];
+        }
+
+        InferenceSession session = ModelStore.Embedded.Session(model);
+        Tensor[] fused = session.Run(feed);
+        Tensor[] plain = session.RunUnfused(feed);
+        output.WriteLine($"{model}: {session.Nodes.Count} nodes, {session.FusedNodes.Count} after fusion");
+        for (int o = 0; o < fused.Length; o++)
+        {
+            Assert.Equal(plain[o].Shape, fused[o].Shape);
+            Assert.True(plain[o].ToFloatArray().AsSpan().SequenceEqual(fused[o].ToFloatArray()), $"output {o} differs");
+        }
+    }
+
+    /// <summary>
     /// Floats agree when every element is within <c>1e-3·(|ref| + rms(ref)) + 1e-5</c>: relative for
     /// large values, scaled to the tensor's own magnitude for values near zero. Integers and booleans
     /// must agree exactly.

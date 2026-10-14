@@ -15,6 +15,8 @@ public sealed class InferenceSession
     private readonly Dictionary<string, Tensor> _constants = new(StringComparer.Ordinal);
     private readonly List<OnnxNode> _nodes = [];
     private readonly Operators.Kernel[] _kernels;
+    private readonly List<OnnxNode> _fusedNodes;
+    private readonly Operators.Kernel[] _fusedKernels;
 
     /// <summary>Creates a session over a parsed model.</summary>
     public InferenceSession(OnnxModel model)
@@ -54,7 +56,10 @@ public sealed class InferenceSession
         }
 
         _graphOutputs = new HashSet<string>(_graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
-        _plan = new Lazy<Plan>(BuildPlan);
+        _fusedNodes = Environment.GetEnvironmentVariable("NANOOCR_NO_FUSION") == "1" ? _nodes : Fuse(_nodes, _graphOutputs);
+        _fusedKernels = _fusedNodes.Select(n => Operators.Resolve(n)!).ToArray();
+        _plan = new Lazy<Plan>(() => BuildPlan(_nodes));
+        _fusedPlan = new Lazy<Plan>(() => BuildPlan(_fusedNodes));
         InputNames = _graph.Inputs.Select(i => i.Name).ToArray();
         OutputNames = _graph.Outputs.Select(o => o.Name).ToArray();
     }
@@ -74,8 +79,11 @@ public sealed class InferenceSession
     /// <summary>Names of the graph outputs, in declaration order.</summary>
     public IReadOnlyList<string> OutputNames { get; }
 
-    /// <summary>Nodes that execute (constants folded away), in order.</summary>
+    /// <summary>Nodes that execute (constants folded away), in order, before fusion.</summary>
     public IReadOnlyList<OnnxNode> Nodes => _nodes;
+
+    /// <summary>The nodes a run without an observer executes: <see cref="Nodes"/> after fusion.</summary>
+    public IReadOnlyList<OnnxNode> FusedNodes => _fusedNodes;
 
     /// <summary>Accumulates time per operator type when set.</summary>
     public Dictionary<string, double>? Profile { get; set; }
@@ -87,11 +95,17 @@ public sealed class InferenceSession
     /// <param name="inputs">Graph inputs by name. They are not released.</param>
     /// <param name="observer">
     /// Called with every node output as it is produced (name, tensor), before anything is
-    /// released — the hook the per-layer parity tests use.
+    /// released — the hook the per-layer parity tests use. A run with an observer executes the
+    /// graph as written, without fusion, so that every node output exists.
     /// </param>
-    public Tensor[] Run(IReadOnlyDictionary<string, Tensor> inputs, Action<string, Tensor>? observer = null)
+    public Tensor[] Run(IReadOnlyDictionary<string, Tensor> inputs, Action<string, Tensor>? observer = null) =>
+        observer is null ? Run(inputs, _fusedNodes, _fusedKernels, _fusedPlan.Value, null) : Run(inputs, _nodes, _kernels, _plan.Value, observer);
+
+    /// <summary>Runs the graph as written, without fusion (for comparing the two).</summary>
+    public Tensor[] RunUnfused(IReadOnlyDictionary<string, Tensor> inputs) => Run(inputs, _nodes, _kernels, _plan.Value, null);
+
+    private Tensor[] Run(IReadOnlyDictionary<string, Tensor> inputs, List<OnnxNode> nodes, Operators.Kernel[] kernels, Plan plan, Action<string, Tensor>? observer)
     {
-        Plan plan = _plan.Value;
         var values = new Tensor?[plan.SlotCount];
         var owned = new bool[plan.SlotCount];
         foreach (var (slot, t) in plan.Constants)
@@ -119,9 +133,9 @@ public sealed class InferenceSession
         }
 
         var args = new List<Tensor?>(8);
-        for (int i = 0; i < _nodes.Count; i++)
+        for (int i = 0; i < nodes.Count; i++)
         {
-            OnnxNode node = _nodes[i];
+            OnnxNode node = nodes[i];
             int[] ins = plan.NodeInputs[i];
             args.Clear();
             for (int k = 0; k < ins.Length; k++)
@@ -141,7 +155,7 @@ public sealed class InferenceSession
             Tensor[] results;
             try
             {
-                results = _kernels[i](node, args);
+                results = kernels[i](node, args);
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
@@ -230,12 +244,13 @@ public sealed class InferenceSession
     }
 
     private readonly Lazy<Plan> _plan;
+    private readonly Lazy<Plan> _fusedPlan;
     private readonly List<string> _folded = [];
 
     /// <summary>Node outputs computed once at load because every input was constant.</summary>
     public IReadOnlyList<string> FoldedValues => _folded;
 
-    private Plan BuildPlan()
+    private Plan BuildPlan(List<OnnxNode> nodes)
     {
         var slots = new Dictionary<string, int>(StringComparer.Ordinal);
         int Slot(string name)
@@ -256,13 +271,13 @@ public sealed class InferenceSession
         }
 
         plan.InputSlots = _graph.Inputs.Select(i => Slot(i.Name)).ToArray();
-        plan.NodeInputs = _nodes.Select(n => n.Inputs.Select(x => x.Length == 0 ? -1 : Slot(x)).ToArray()).ToArray();
-        plan.NodeOutputs = _nodes.Select(n => n.Outputs.Select(x => x.Length == 0 ? -1 : Slot(x)).ToArray()).ToArray();
+        plan.NodeInputs = nodes.Select(n => n.Inputs.Select(x => x.Length == 0 ? -1 : Slot(x)).ToArray()).ToArray();
+        plan.NodeOutputs = nodes.Select(n => n.Outputs.Select(x => x.Length == 0 ? -1 : Slot(x)).ToArray()).ToArray();
         plan.OutputSlots = _graph.Outputs.Select(o => Slot(o.Name)).ToArray();
         plan.SlotCount = slots.Count;
         plan.LastUse = new int[plan.SlotCount];
         Array.Fill(plan.LastUse, -1);
-        for (int i = 0; i < _nodes.Count; i++)
+        for (int i = 0; i < nodes.Count; i++)
         {
             foreach (int s in plan.NodeInputs[i])
             {
@@ -279,7 +294,7 @@ public sealed class InferenceSession
             plan.IsOutput[s] = true;
         }
 
-        var frees = Enumerable.Range(0, _nodes.Count).Select(_ => new List<int>()).ToArray();
+        var frees = Enumerable.Range(0, nodes.Count).Select(_ => new List<int>()).ToArray();
         for (int s = 0; s < plan.SlotCount; s++)
         {
             if (plan.LastUse[s] >= 0 && !plan.IsOutput[s])
@@ -290,6 +305,126 @@ public sealed class InferenceSession
 
         plan.Frees = frees.Select(f => f.ToArray()).ToArray();
         return plan;
+    }
+
+    /// <summary>
+    /// Folds the element-wise nodes that follow a convolution into it — what ONNX Runtime's
+    /// <c>ConvActivationFusion</c> and <c>ConvAddFusion</c> do: <c>Conv → Add(residual)</c> and
+    /// <c>Conv [→ Add] → HardSwish | Relu | Sigmoid</c>, wherever each intermediate value has
+    /// exactly one reader and is not a graph output. The convolution then applies the residual and
+    /// the activation to each stretch of its output while it is still in cache (see
+    /// <c>Operators.Epilogue</c>): the same operations in the same order, so the outputs are
+    /// identical, minus a full write and re-read of every intermediate tensor. The fused node takes
+    /// the place of the last node it absorbed, where the residual is known to exist.
+    /// </summary>
+    private static List<OnnxNode> Fuse(List<OnnxNode> nodes, HashSet<string> graphOutputs)
+    {
+        var readers = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            foreach (string input in nodes[i].Inputs)
+            {
+                if (input.Length > 0)
+                {
+                    (readers.TryGetValue(input, out var l) ? l : readers[input] = []).Add(i);
+                }
+            }
+        }
+
+        bool SoleReader(string value, out int reader)
+        {
+            reader = -1;
+            if (graphOutputs.Contains(value) || !readers.TryGetValue(value, out var l) || l.Count != 1)
+            {
+                return false;
+            }
+
+            reader = l[0];
+            return true;
+        }
+
+        static bool Default(OnnxNode n) => n.Domain is "" or "ai.onnx";
+        var removed = new bool[nodes.Count];
+        var replacement = new OnnxNode?[nodes.Count];
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            OnnxNode conv = nodes[i];
+            if (conv.OpType != "Conv" || !Default(conv) || conv.Outputs.Count != 1 || conv.Inputs.Count > 3 || removed[i])
+            {
+                continue;
+            }
+
+            string value = conv.Outputs[0];
+            int at = i;
+            string? residual = null;
+            string act = "";
+            if (SoleReader(value, out int j) && !removed[j] && nodes[j].OpType == "Add" && Default(nodes[j]) && nodes[j].Inputs.Count == 2
+                && nodes[j].Inputs[0] != nodes[j].Inputs[1])
+            {
+                residual = nodes[j].Inputs[0] == value ? nodes[j].Inputs[1] : nodes[j].Inputs[0];
+                value = nodes[j].Outputs[0];
+                at = j;
+            }
+
+            if (SoleReader(value, out j) && !removed[j] && nodes[j].OpType is "HardSwish" or "Relu" or "Sigmoid" && Default(nodes[j]))
+            {
+                act = nodes[j].OpType;
+                value = nodes[j].Outputs[0];
+                at = j;
+            }
+
+            if (at == i)
+            {
+                continue;
+            }
+
+            var fused = new OnnxNode { Name = conv.Name, OpType = "Conv", Domain = conv.Domain };
+            fused.Inputs.AddRange(conv.Inputs);
+            if (residual is not null)
+            {
+                while (fused.Inputs.Count < 3)
+                {
+                    fused.Inputs.Add("");
+                }
+
+                fused.Inputs.Add(residual);
+            }
+
+            fused.Outputs.Add(value);
+            foreach (var (k, a) in conv.Attributes)
+            {
+                fused.Attributes[k] = a;
+            }
+
+            if (act.Length > 0)
+            {
+                fused.Attributes[Operators.FusedActivation] = new OnnxAttribute { Name = Operators.FusedActivation, S = act };
+            }
+
+            removed[i] = true;
+            if (residual is not null)
+            {
+                removed[readers[conv.Outputs[0]][0]] = true;
+            }
+
+            removed[at] = true;
+            replacement[at] = fused;
+        }
+
+        var result = new List<OnnxNode>(nodes.Count);
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            if (replacement[i] is not null)
+            {
+                result.Add(replacement[i]!);
+            }
+            else if (!removed[i])
+            {
+                result.Add(nodes[i]);
+            }
+        }
+
+        return result;
     }
 
     /// <summary>Runs the graph with inputs given in <see cref="InputNames"/> order.</summary>

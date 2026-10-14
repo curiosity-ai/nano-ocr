@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Numerics;
 using System.Numerics.Tensors;
+using System.Runtime.Intrinsics;
 using NanoOcr.Core;
 
 namespace NanoOcr.Onnx;
@@ -11,6 +12,8 @@ internal static partial class Operators
     {
         Tensor input = x[0]!, weight = x[1]!;
         Tensor? bias = x.Count > 2 ? x[2] : null;
+        Tensor? residual = x.Count > 3 ? x[3] : null;
+        string act = node.Str(FusedActivation, "");
         if (input.Rank == 3)
         {
             // A 1-D convolution is a 2-D one over a height of 1.
@@ -18,6 +21,10 @@ internal static partial class Operators
             Tensor w2 = weight.Reshape([weight.Shape[0], weight.Shape[1], 1, weight.Shape[2]]);
             var attrs = new OnnxNode { OpType = "Conv", Name = node.Name };
             attrs.Attributes["group"] = new OnnxAttribute { Name = "group", I = node.Int("group", 1) };
+            if (act.Length > 0)
+            {
+                attrs.Attributes[FusedActivation] = new OnnxAttribute { Name = FusedActivation, S = act };
+            }
             long[] k = node.Ints("strides") ?? [1];
             long[] d = node.Ints("dilations") ?? [1];
             long[] pd = node.Ints("pads") ?? [0, 0];
@@ -30,11 +37,17 @@ internal static partial class Operators
             a = new OnnxAttribute { Name = "pads" };
             a.Ints.AddRange([0, pd[0], 0, pd[1]]);
             attrs.Attributes["pads"] = a;
-            Tensor out2 = Conv(attrs, [in2, w2, bias]);
+            Tensor? res2 = residual?.Rank == 3 ? residual.Reshape([residual.Shape[0], residual.Shape[1], 1, residual.Shape[2]]) : residual;
+            Tensor out2 = Conv(attrs, res2 is null ? [in2, w2, bias] : [in2, w2, bias, res2]);
             Tensor out1 = out2.Reshape([out2.Shape[0], out2.Shape[1], out2.Shape[3]]);
             in2.Release();
             w2.Release();
             out2.Release();
+            if (res2 is not null && !ReferenceEquals(res2, residual))
+            {
+                res2.Release();
+            }
+
             return out1;
         }
 
@@ -68,16 +81,90 @@ internal static partial class Operators
         Tensor output = Tensor.Float([n, m, oh, ow]);
         var p = new ConvParams(c, h, w, m, cg, kh, kw, sh, sw, dh, dw, pt, pl, oh, ow, group);
         float[]? b = bias?.FloatArray;
+
+        // A residual of another shape (a broadcast) is added after the convolution instead.
+        bool fuseResidual = residual is not null && residual.Type == ElementType.Float && residual.Shape.AsSpan().SequenceEqual(output.Shape);
+        var epilogue = new Epilogue(fuseResidual ? residual!.FloatArray : null, ParseActivation(residual is null || fuseResidual ? act : ""));
         if (group == c && group == m && cg == 1)
         {
-            Depthwise(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p);
+            Depthwise(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p, epilogue);
         }
         else
         {
-            GroupedGemm(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p);
+            GroupedGemm(input.FloatArray, weight.FloatArray, b, output.FloatArray, n, p, epilogue);
+        }
+
+        epilogue.ApplyWhole(output.FloatArray, output.Length);
+        if (residual is not null && !fuseResidual)
+        {
+            Tensor sum = Binary(output, residual, BinaryOp.Add);
+            output.Release();
+            output = sum;
+            if (act.Length > 0)
+            {
+                Tensor activated = Unary(output, Enum.Parse<UnaryOp>(act));
+                output.Release();
+                output = activated;
+            }
         }
 
         return output;
+    }
+
+    /// <summary>
+    /// The attribute <see cref="InferenceSession"/>'s fusion pass puts on a Conv that absorbed the
+    /// activation after it: <c>HardSwish</c>, <c>Relu</c> or <c>Sigmoid</c>. A fourth input is a
+    /// residual absorbed from an <c>Add</c>, added before the activation.
+    /// </summary>
+    internal const string FusedActivation = "nanoocr.activation";
+
+    internal enum Activation { None, HardSwish, Relu, Sigmoid }
+
+    private static Activation ParseActivation(string act) => act switch
+    {
+        "" => Activation.None,
+        "HardSwish" => Activation.HardSwish,
+        "Relu" => Activation.Relu,
+        "Sigmoid" => Activation.Sigmoid,
+        _ => throw new NotSupportedException($"Fused activation {act}."),
+    };
+
+    /// <summary>
+    /// What a fused convolution does to a stretch of its output once it is computed, while the
+    /// stretch is still in cache: add the residual, then apply the activation — the same
+    /// operations, in the same order, as the <c>Add</c> and activation nodes it replaced.
+    /// </summary>
+    internal readonly record struct Epilogue(float[]? Residual, Activation Act)
+    {
+        public bool IsEmpty => Residual is null && Act == Activation.None;
+
+        /// <summary>Applies the epilogue to <paramref name="dst"/>, which starts at <paramref name="offset"/> of the output.</summary>
+        public void Apply(Span<float> dst, int offset)
+        {
+            if (Residual is not null)
+            {
+                TensorPrimitives.Add(dst, Residual.AsSpan(offset, dst.Length), dst);
+            }
+
+            switch (Act)
+            {
+                case Activation.HardSwish: Activations.HardSwish(dst, dst); break;
+                case Activation.Relu: TensorPrimitives.Max(dst, 0f, dst); break;
+            }
+        }
+
+        /// <summary>
+        /// The part of the epilogue that runs over the whole output instead: the sigmoid, whose
+        /// vectorized and scalar paths round differently, so it is applied over the same spans the
+        /// unfused <c>Sigmoid</c> node would use (it follows only the small squeeze-excite convolutions).
+        /// </summary>
+        public void ApplyWhole(float[] output, int length)
+        {
+            if (Act == Activation.Sigmoid)
+            {
+                Parallelism.For(length, (long)length * 8, (s, e) => TensorPrimitives.Sigmoid(output.AsSpan(s, e - s), output.AsSpan(s, e - s)));
+            }
+        }
     }
 
     internal readonly record struct ConvParams(
@@ -87,7 +174,7 @@ internal static partial class Operators
     /// Convolution as im2col + GEMM, tiled over output pixels so each worker's column buffer stays
     /// cache-sized. A 1×1, stride-1, unpadded convolution reads its input in place.
     /// </summary>
-    private static void GroupedGemm(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p)
+    private static void GroupedGemm(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
     {
         int mg = p.M / p.Group;
         int k = p.Cg * p.Kh * p.Kw;
@@ -118,16 +205,25 @@ internal static partial class Operators
             if (pointwise)
             {
                 GemmSerial.Multiply(mg, cols, k, wg, k, input.AsSpan(inBase + p0), p.H * p.W, outSpan.Slice(p0), pixels, accumulate: true);
-                return;
+            }
+            else
+            {
+                Im2Col(input.AsSpan(inBase), p, p0, p1, col!);
+                GemmSerial.Multiply(mg, cols, k, wg, k, col, cols, outSpan.Slice(p0), pixels, accumulate: true);
             }
 
-            Im2Col(input.AsSpan(inBase), p, p0, p1, col!);
-            GemmSerial.Multiply(mg, cols, k, wg, k, col, cols, outSpan.Slice(p0), pixels, accumulate: true);
+            if (!epilogue.IsEmpty)
+            {
+                for (int r = 0; r < mg; r++)
+                {
+                    epilogue.Apply(outSpan.Slice((r * pixels) + p0, cols), outBase + (r * pixels) + p0);
+                }
+            }
         }
 
         if (pointwise && p.Group == 1 && n > 1 && pixels < 1024)
         {
-            PointwiseBatched(input, weight, bias, output, n, p);
+            PointwiseBatched(input, weight, bias, output, n, p, epilogue);
             return;
         }
 
@@ -170,7 +266,7 @@ internal static partial class Operators
     /// and unpacked. Per item the product would be 128 columns wide with a scalar tail; packed it is
     /// thousands wide and splits across every core.
     /// </summary>
-    private static void PointwiseBatched(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p)
+    private static void PointwiseBatched(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
     {
         int t = p.H * p.W, c = p.C, m = p.M, cols = n * t;
         float[] packed = System.Buffers.ArrayPool<float>.Shared.Rent(c * cols);
@@ -203,6 +299,11 @@ internal static partial class Operators
                         else
                         {
                             TensorPrimitives.Add(src, bias[r], dst);
+                        }
+
+                        if (!epilogue.IsEmpty)
+                        {
+                            epilogue.Apply(dst, ((b * m) + r) * t);
                         }
                     }
                 }
@@ -265,61 +366,155 @@ internal static partial class Operators
         }
     }
 
-    /// <summary>Depthwise convolution: one filter per channel, accumulated row by row.</summary>
-    private static void Depthwise(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p)
+    /// <summary>
+    /// Depthwise convolution: one filter per channel. Each plane is first copied into a zero-padded
+    /// scratch plane split into <c>stride</c> column phases, so that for every tap the inputs of
+    /// consecutive output columns are consecutive floats (a stride-2 row becomes two stride-1
+    /// rows); then each vector of output columns accumulates all <c>kh·kw</c> taps in a register,
+    /// bias first and taps in row-major order, one fused multiply-add per tap. A padded tap adds
+    /// <c>0·w</c>, which leaves the sum unchanged, so the padding needs no bounds checks.
+    /// </summary>
+    private static void Depthwise(float[] input, float[] weight, float[]? bias, float[] output, int n, ConvParams p, Epilogue epilogue)
     {
         int planes = n * p.C;
         long work = (long)planes * p.Oh * p.Ow * p.Kh * p.Kw;
+
+        // The padded plane: rows -Pt .. (Oh-1)·Sh + (Kh-1)·Dh - Pt, likewise columns; each of the
+        // Sw phases holds every Sw-th padded column, with a vector of slack for the last chunk.
+        int hp = ((p.Oh - 1) * p.Sh) + ((p.Kh - 1) * p.Dh) + 1;
+        int wp = ((p.Ow - 1) * p.Sw) + ((p.Kw - 1) * p.Dw) + 1;
+        int wq = ((wp + p.Sw - 1) / p.Sw) + 16;
+        int scratch = p.Sw * hp * wq;
         Parallelism.For(planes, work, (s, e) =>
         {
-            for (int plane = s; plane < e; plane++)
+            float[] pad = System.Buffers.ArrayPool<float>.Shared.Rent(scratch);
+            Span<int> taps = stackalloc int[p.Kh * p.Kw];
+            try
             {
-                int ch = plane % p.C;
-                ReadOnlySpan<float> src = input.AsSpan(plane * p.H * p.W, p.H * p.W);
-                Span<float> dst = output.AsSpan(plane * p.Oh * p.Ow, p.Oh * p.Ow);
-                ReadOnlySpan<float> kernel = weight.AsSpan(ch * p.Kh * p.Kw, p.Kh * p.Kw);
-                dst.Fill(bias is null ? 0f : bias[ch]);
-                for (int oy = 0; oy < p.Oh; oy++)
+                for (int plane = s; plane < e; plane++)
                 {
-                    Span<float> outRow = dst.Slice(oy * p.Ow, p.Ow);
-                    for (int ky = 0; ky < p.Kh; ky++)
+                    int ch = plane % p.C;
+                    PadPhases(input.AsSpan(plane * p.H * p.W, p.H * p.W), p, hp, wq, pad);
+                    for (int ky = 0, t = 0; ky < p.Kh; ky++)
                     {
-                        int iy = (oy * p.Sh) - p.Pt + (ky * p.Dh);
-                        if ((uint)iy >= (uint)p.H)
+                        for (int kx = 0; kx < p.Kw; kx++, t++)
                         {
-                            continue;
+                            int c = kx * p.Dw;
+                            taps[t] = ((c % p.Sw) * hp * wq) + (ky * p.Dh * wq) + (c / p.Sw);
                         }
+                    }
 
-                        ReadOnlySpan<float> inRow = src.Slice(iy * p.W, p.W);
-                        for (int kx = 0; kx < p.Kw; kx++)
-                        {
-                            float wv = kernel[(ky * p.Kw) + kx];
-                            int off = (kx * p.Dw) - p.Pl;
-
-                            // Output columns whose tap lands inside the row.
-                            int lo = off >= 0 ? 0 : (-off + p.Sw - 1) / p.Sw;
-                            int hi = Math.Min(p.Ow, ((p.W - 1 - off) / p.Sw) + 1);
-                            if (hi <= lo)
-                            {
-                                continue;
-                            }
-
-                            if (p.Sw == 1)
-                            {
-                                TensorPrimitives.MultiplyAdd(inRow.Slice(lo + off, hi - lo), wv, outRow.Slice(lo, hi - lo), outRow.Slice(lo, hi - lo));
-                            }
-                            else
-                            {
-                                for (int ox = lo; ox < hi; ox++)
-                                {
-                                    outRow[ox] = MathF.FusedMultiplyAdd(inRow[(ox * p.Sw) + off], wv, outRow[ox]);
-                                }
-                            }
-                        }
+                    Span<float> dst = output.AsSpan(plane * p.Oh * p.Ow, p.Oh * p.Ow);
+                    DepthwisePlane(pad, taps, weight.AsSpan(ch * p.Kh * p.Kw, p.Kh * p.Kw), bias is null ? 0f : bias[ch], p, wq, dst);
+                    if (!epilogue.IsEmpty)
+                    {
+                        epilogue.Apply(dst, plane * p.Oh * p.Ow);
                     }
                 }
             }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(pad);
+            }
         });
+    }
+
+    /// <summary>Copies a plane into the zero-padded, phase-split layout <see cref="Depthwise"/> reads.</summary>
+    private static void PadPhases(ReadOnlySpan<float> src, ConvParams p, int hp, int wq, float[] pad)
+    {
+        Array.Clear(pad, 0, p.Sw * hp * wq);
+        for (int y = 0; y < hp; y++)
+        {
+            int iy = y - p.Pt;
+            if ((uint)iy >= (uint)p.H)
+            {
+                continue;
+            }
+
+            ReadOnlySpan<float> row = src.Slice(iy * p.W, p.W);
+            if (p.Sw == 1)
+            {
+                // Padded column X holds input column X - Pl.
+                int x0 = Math.Max(0, p.Pl), from = Math.Max(0, -p.Pl);
+                int len = Math.Min(p.W - from, wq - 16 - x0);
+                if (len > 0)
+                {
+                    row.Slice(from, len).CopyTo(pad.AsSpan((y * wq) + x0, len));
+                }
+
+                continue;
+            }
+
+            for (int q = 0; q < p.Sw; q++)
+            {
+                Span<float> dst = pad.AsSpan((q * hp * wq) + (y * wq), wq);
+                for (int j = 0; j < wq - 16; j++)
+                {
+                    int ix = (j * p.Sw) + q - p.Pl;
+                    if ((uint)ix < (uint)p.W)
+                    {
+                        dst[j] = row[ix];
+                    }
+                }
+            }
+        }
+    }
+
+    private static unsafe void DepthwisePlane(float[] pad, ReadOnlySpan<int> taps, ReadOnlySpan<float> w, float bias, ConvParams p, int wq, Span<float> dst)
+    {
+        int nt = taps.Length;
+        fixed (float* src = pad)
+        fixed (int* tp = taps)
+        fixed (float* wp = w)
+        fixed (float* d = dst)
+        {
+            for (int oy = 0; oy < p.Oh; oy++)
+            {
+                float* row = src + (oy * p.Sh * wq);
+                float* o = d + (oy * p.Ow);
+                int ox = 0;
+                if (Gemm.Wide)
+                {
+                    for (; ox + 16 <= p.Ow; ox += 16)
+                    {
+                        var acc = Vector512.Create(bias);
+                        float* r = row + ox;
+                        for (int t = 0; t < nt; t++)
+                        {
+                            acc = Vector512.FusedMultiplyAdd(Vector512.Load(r + tp[t]), Vector512.Create(wp[t]), acc);
+                        }
+
+                        acc.Store(o + ox);
+                    }
+                }
+                else if (Vector256.IsHardwareAccelerated)
+                {
+                    for (; ox + 8 <= p.Ow; ox += 8)
+                    {
+                        var acc = Vector256.Create(bias);
+                        float* r = row + ox;
+                        for (int t = 0; t < nt; t++)
+                        {
+                            acc = Vector256.FusedMultiplyAdd(Vector256.Load(r + tp[t]), Vector256.Create(wp[t]), acc);
+                        }
+
+                        acc.Store(o + ox);
+                    }
+                }
+
+                for (; ox < p.Ow; ox++)
+                {
+                    float acc = bias;
+                    float* r = row + ox;
+                    for (int t = 0; t < nt; t++)
+                    {
+                        acc = MathF.FusedMultiplyAdd(r[tp[t]], wp[t], acc);
+                    }
+
+                    o[ox] = acc;
+                }
+            }
+        }
     }
 
     internal static Tensor MatMul(Tensor a, Tensor b)
