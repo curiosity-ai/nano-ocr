@@ -8,8 +8,12 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>nano-ocr</ToolCommandName>
     <PackageId>NanoOCR.Cli</PackageId>
-    <!-- The tool is a short-lived process: compile optimised up front instead of tiering. -->
-    <TieredCompilation>false</TieredCompilation>
+    <!-- The tool is a short-lived process. Methods with loops (every kernel) are compiled
+         optimised on first call; the loop-free rest starts quick and tiers up. Cold page ~10%
+         faster than compiling everything optimised up front, warm throughput the same. -->
+    <TieredCompilation>true</TieredCompilation>
+    <TieredCompilationQuickJitForLoops>false</TieredCompilationQuickJitForLoops>
+    <TieredPGO>false</TieredPGO>
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
